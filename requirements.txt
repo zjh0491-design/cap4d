@@ -1,16 +1,9 @@
-numpy
-torch
-torchvision
 omegaconf
 pytorch-lightning
 einops
 opencv-python
 decord
 scipy==1.13.1
-chumpy
-gsplat 
 plyfile
 roma
-xformers
-triton
 matplotlib

@@ -119,10 +119,21 @@ class L2CSTracker:
 
         self.device = device
 
-        self.fa = face_alignment.FaceAlignment(
-            3, flip_input=False, face_detector="sfd", device=device, 
-            face_detector_kwargs={"filter_threshold": 0.9}
-        )
+        try:
+            self.fa = face_alignment.FaceAlignment(
+                3,
+                flip_input=False,
+                face_detector="sfd",
+                device=device,
+                face_detector_kwargs={"filter_threshold": 0.9},
+            )
+        except TypeError:
+            self.fa = face_alignment.FaceAlignment(
+                3,
+                flip_input=False,
+                face_detector="sfd",
+                device=device,
+            )
         # self.retina = RetinaFace()
         self.gaze_trafo = transforms.Compose([
             transforms.Resize((448, 448)),

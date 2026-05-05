@@ -192,3 +192,22 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# local cuda
+cuda-11.8/
+
+# weights / checkpoints
+data/weights/
+*.ckpt
+*.pth
+*.pt
+
+# local datasets / outputs
+examples/output/
+examples/debug_output/
+examples/input/
+
+# cache
+__pycache__/
+*.pyc
+.cache/

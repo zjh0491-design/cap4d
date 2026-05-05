@@ -1,5 +1,5 @@
 opt_params:
-  iterations: 100_000
+  iterations: 150_000
 
   sh_warmup_iterations: 1_000
 
@@ -16,19 +16,19 @@ opt_params:
   opacity_lr: 0.025
   scaling_lr: 0.005  # (scaled up according to mean triangle scale)  # 0.005 (original)
   rotation_lr: 0.001
-  percent_dense: 0.01
+  percent_dense: 0.05
   lambda_dssim: 0.4
 
   densification_interval: 2000
-  densify_grad_threshold: 1e-6
+  densify_grad_threshold: 1e-7
   opacity_reset_interval: 20_000
-  densify_until_iter: 70_000
-  densify_from_iter: 8_000
+  densify_until_iter: 140_000
+  densify_from_iter: 1_000
 
   position_lr_init: 5e-3
   position_lr_final: 5e-5
   position_lr_delay_mult: 0.01
-  position_lr_max_steps: 100_000
+  position_lr_max_steps: 150_000
   
   w_lpips: 0.1
   lambda_lpips_end: 0.9
@@ -58,6 +58,6 @@ model_params:
   gaussian_init_type: "scaled"
   use_expr_mask: True
   uv_resolution: 128
-  n_gaussians_init: 100_000
+  n_gaussians_init: 150_000
 
-  sh_degree: 3
+  sh_degree: 5
