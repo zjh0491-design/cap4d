@@ -1,0 +1,63 @@
+opt_params:
+  iterations: 1_000
+
+  sh_warmup_iterations: 100
+
+  # clip_probability: 0.2
+
+  lambda_scale: 1.
+  threshold_scale: 1.
+  lambda_xyz: 1e-3
+  threshold_xyz: 2.
+  metric_xyz: False
+  metric_scale: False
+
+  feature_lr: 0.0025
+  opacity_lr: 0.025
+  scaling_lr: 0.005  # (scaled up according to mean triangle scale)  # 0.005 (original)
+  rotation_lr: 0.001
+  percent_dense: 0.01
+  lambda_dssim: 0.4
+
+  densification_interval: 200
+  densify_grad_threshold: 1e-6
+  opacity_reset_interval: 200
+  densify_until_iter: 700
+  densify_from_iter: 80
+
+  position_lr_init: 5e-3
+  position_lr_final: 5e-5
+  position_lr_delay_mult: 0.01
+  position_lr_max_steps: 1000
+  
+  w_lpips: 0.1
+  lambda_lpips_end: 0.9
+  lpips_linear_start: 100
+  lpips_linear_end: 600
+  deform_net_w_decay: 2e-3
+  deform_net_lr_init: 1e-5
+  deform_net_lr_final: 1e-7
+  deform_net_lr_delay_mult: 0.01
+  deform_net_lr_max_steps: 1000
+  lambda_laplacian: 1.0
+  lambda_relative_deform: 0.4
+  lambda_relative_rot: 0.005
+
+  neck_lr_init: 1e-5
+  neck_lr_final: 1e-7
+  neck_lr_delay_mult: 0.01
+  neck_lr_max_steps: 1000
+
+  lambda_neck: 1.0
+  
+model_params:
+  n_unet_layers: 6
+  n_points_per_triangle: 2
+  use_lower_jaw: True
+  static_neck: False
+  gaussian_init_type: "scaled"
+  use_expr_mask: True
+  uv_resolution: 128
+  n_gaussians_init: 100_000
+
+  sh_degree: 3
