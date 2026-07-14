@@ -26,6 +26,17 @@ from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
+def cameraList_from_camInfos_with_metadata(cam_infos, resolution_scale):
+    cameras = cameraList_from_camInfos(cam_infos, resolution_scale)
+    for camera, cam_info in zip(cameras, cam_infos):
+        camera.is_pseudo = getattr(cam_info, "is_pseudo", False)
+        camera.is_back_view = getattr(cam_info, "is_back_view", False)
+        camera.pseudo_weight = getattr(cam_info, "pseudo_weight", 1.0)
+        camera.source_id = getattr(cam_info, "source_id", None)
+        camera.source_path = getattr(cam_info, "source_path", None)
+    return cameras
+
+
 class CameraDataset(torch.utils.data.Dataset):
     def __init__(self, cameras: List[Camera]):
         self.cameras = cameras
@@ -87,6 +98,8 @@ class Scene:
         gaussians : CAP4DGaussianModel, 
         source_paths=None,
         target_paths=None,
+        enable_pseudo_back=False,
+        pseudo_back_paths=None,
         shuffle=True, 
         resolution_scales=[1.0],
     ):
@@ -100,6 +113,8 @@ class Scene:
         scene_info = loadCAP4DDataset(
             source_paths=source_paths, 
             target_paths=target_paths,
+            enable_pseudo_back=enable_pseudo_back,
+            pseudo_back_paths=pseudo_back_paths,
         )
 
         # process cameras
@@ -134,15 +149,15 @@ class Scene:
         for resolution_scale in resolution_scales:
             if len(scene_info.train_cameras) > 0:
                 print("Loading Training Cameras")
-                self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale)
+                self.train_cameras[resolution_scale] = cameraList_from_camInfos_with_metadata(scene_info.train_cameras, resolution_scale)
                 print("Loading Validation Cameras")
-                self.val_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.val_cameras, resolution_scale)
+                self.val_cameras[resolution_scale] = cameraList_from_camInfos_with_metadata(scene_info.val_cameras, resolution_scale)
                 print("Loading Test Cameras")
-                self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale)
+                self.test_cameras[resolution_scale] = cameraList_from_camInfos_with_metadata(scene_info.test_cameras, resolution_scale)
 
             if len(scene_info.tgt_cameras) > 0:
                 print("Loading Tgt Cameras")
-                self.tgt_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.tgt_cameras, resolution_scale)
+                self.tgt_cameras[resolution_scale] = cameraList_from_camInfos_with_metadata(scene_info.tgt_cameras, resolution_scale)
         
         # process meshes
         if gaussians.binding != None:

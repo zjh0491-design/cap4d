@@ -20,3 +20,22 @@ lightning_logs/
 
 examples/output/
 data/weights/
+
+# Local datasets and toolchains
+/HDTF/
+/Xnemo/
+/cuda-*/
+/weights/
+
+# Generated results
+/logs/
+/reports/
+/extra/
+/examples/debug_output/
+/examples/output/
+nohup.out
+
+# Temporary files
+*.bak
+*.safetensors
+events.out.tfevents*

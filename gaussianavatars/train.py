@@ -17,11 +17,12 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
+from PIL import Image
 
 from gaussianavatars.utils.system_utils import searchForMaxIteration
 from gaussianavatars.gaussian_renderer.gsplat_renderer import render
 from gaussianavatars.scene.cap4d_gaussian_model import CAP4DGaussianModel
-from gaussianavatars.scene.scene import Scene
+from gaussianavatars.scene.scene import CameraDataset, Scene
 from gaussianavatars.utils.loss_utils import l1_loss, ssim
 from gaussianavatars.utils.general_utils import safe_state
 from gaussianavatars.utils.image_utils import psnr, error_map
@@ -33,6 +34,41 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
+def next_camera_from_loader(loader, loader_iter):
+    try:
+        camera = next(loader_iter)
+    except StopIteration:
+        loader_iter = iter(loader)
+        camera = next(loader_iter)
+    return camera, loader_iter
+
+
+def masked_l1_loss(network_output, gt, mask):
+    denom = mask.sum().clamp_min(1.) * network_output.shape[0]
+    return (torch.abs(network_output - gt) * mask).sum() / denom
+
+
+def save_tensor_image(tensor, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = tensor.detach().float().cpu().clamp(0., 1.)
+    if image.ndim == 3 and image.shape[0] == 1:
+        image = image[0]
+    elif image.ndim == 3:
+        image = image.permute(1, 2, 0)
+    array = (image.numpy() * 255.).round().astype("uint8")
+    Image.fromarray(array).save(path)
+
+
+def linear_warmup_scale(iteration: int, start_iter: int, warmup_iters: int, end_iter: int = None) -> float:
+    if iteration < start_iter:
+        return 0.0
+    if end_iter is not None and end_iter >= 0 and iteration > end_iter:
+        return 0.0
+    if warmup_iters <= 0:
+        return 1.0
+    return max(0.0, min(1.0, float(iteration - start_iter + 1) / float(warmup_iters)))
+
+
 def training(
     source_paths,
     model_path,
@@ -41,6 +77,16 @@ def training(
     testing_iterations, 
     checkpoint_iterations, 
     load_existing_checkpoint, 
+    enable_pseudo_back=False,
+    pseudo_back_json=None,
+    lambda_back_rgb=0.3,
+    lambda_back_lpips=0.02,
+    lambda_back_sil=0.2,
+    back_start_iter=10000,
+    back_end_iter=None,
+    back_warmup_iters=10000,
+    back_sample_ratio=0.10,
+    pseudo_back_densify_start_iter=-1,
 ):
     first_iter = 0
     tb_writer = None
@@ -55,6 +101,8 @@ def training(
         model_path=model_path, 
         source_paths=source_paths, 
         gaussians=gaussians,
+        enable_pseudo_back=enable_pseudo_back,
+        pseudo_back_paths=pseudo_back_json,
     )
     gaussians.training_setup(opt_params)
 
@@ -76,16 +124,70 @@ def training(
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    loader_camera_train = DataLoader(
-        scene.getTrainCameras(), 
-        batch_size=None, 
-        shuffle=True, 
-        num_workers=8, 
-        pin_memory=True, 
-        persistent_workers=True
-    )
-    iter_camera_train = iter(loader_camera_train)
+    loader_camera_train = None
+    iter_camera_train = None
+    loader_camera_real = None
+    iter_camera_real = None
+    loader_camera_pseudo = None
+    iter_camera_pseudo = None
+
+    if enable_pseudo_back:
+        train_cameras = scene.train_cameras[1.0]
+        real_train_cameras = [camera for camera in train_cameras if not getattr(camera, "is_pseudo", False)]
+        pseudo_train_cameras = [camera for camera in train_cameras if getattr(camera, "is_pseudo", False)]
+        print(f"Training cameras: real={len(real_train_cameras)}, pseudo_back={len(pseudo_train_cameras)}")
+        if len(pseudo_train_cameras) == 0:
+            print("WARNING: enable_pseudo_back=True but no pseudo back cameras are available")
+        if back_end_iter is None or back_end_iter < 0:
+            back_end_iter = opt_params["iterations"]
+        back_sample_ratio = max(0.0, min(1.0, back_sample_ratio))
+        print(
+            "Pseudo back schedule:",
+            f"enable={enable_pseudo_back}",
+            f"start={back_start_iter}",
+            f"end={back_end_iter}",
+            f"warmup={back_warmup_iters}",
+            f"max_sample_ratio={back_sample_ratio}",
+            f"lambda_rgb={lambda_back_rgb}",
+            f"lambda_lpips={lambda_back_lpips}",
+            f"lambda_sil={lambda_back_sil}",
+            f"densify_start={pseudo_back_densify_start_iter}",
+        )
+
+        loader_camera_real = DataLoader(
+            CameraDataset(real_train_cameras),
+            batch_size=None,
+            shuffle=True,
+            num_workers=8,
+            pin_memory=True,
+            persistent_workers=True
+        )
+        iter_camera_real = iter(loader_camera_real)
+
+        if len(pseudo_train_cameras) > 0:
+            pseudo_num_workers = min(2, len(pseudo_train_cameras))
+            loader_camera_pseudo = DataLoader(
+                CameraDataset(pseudo_train_cameras),
+                batch_size=None,
+                shuffle=True,
+                num_workers=pseudo_num_workers,
+                pin_memory=True,
+                persistent_workers=pseudo_num_workers > 0
+            )
+            iter_camera_pseudo = iter(loader_camera_pseudo)
+    else:
+        loader_camera_train = DataLoader(
+            scene.getTrainCameras(),
+            batch_size=None,
+            shuffle=True,
+            num_workers=8,
+            pin_memory=True,
+            persistent_workers=True
+        )
+        iter_camera_train = iter(loader_camera_train)
+
     ema_loss_for_log = 0.0
+    pseudo_sample_count = 0
     progress_bar = tqdm(range(first_iter, opt_params["iterations"]), desc="Training progress")
     first_iter += 1
 
@@ -100,11 +202,25 @@ def training(
         if iteration % opt_params["sh_warmup_iterations"] == 0:
             gaussians.oneupSHdegree()
 
-        try:
-            viewpoint_cam = next(iter_camera_train)
-        except StopIteration:
-            iter_camera_train = iter(loader_camera_train)
-            viewpoint_cam = next(iter_camera_train)
+        if enable_pseudo_back:
+            use_pseudo_back = False
+            back_schedule_scale = linear_warmup_scale(
+                iteration,
+                back_start_iter,
+                back_warmup_iters,
+                back_end_iter,
+            )
+            current_back_sample_ratio = back_sample_ratio * back_schedule_scale
+            if loader_camera_pseudo is not None and current_back_sample_ratio > 0.0:
+                use_pseudo_back = torch.rand((), device="cpu").item() < current_back_sample_ratio
+
+            if use_pseudo_back:
+                viewpoint_cam, iter_camera_pseudo = next_camera_from_loader(loader_camera_pseudo, iter_camera_pseudo)
+                pseudo_sample_count += 1
+            else:
+                viewpoint_cam, iter_camera_real = next_camera_from_loader(loader_camera_real, iter_camera_real)
+        else:
+            viewpoint_cam, iter_camera_train = next_camera_from_loader(loader_camera_train, iter_camera_train)
 
         # Set timestep and run FLAME model
         if gaussians.binding != None:
@@ -117,31 +233,53 @@ def training(
             background, 
         )
         image = render_pkg["render"]
+        alpha = render_pkg["alpha"]
         viewspace_point_tensor = render_pkg["viewspace_points"]
         visibility_filter = render_pkg["visibility_filter"]
         radii = render_pkg["radii"]
 
         # load gt image and mask
         gt_image = viewpoint_cam.original_image.cuda()
-        mask = viewpoint_cam.mask[..., None].cuda().permute(2, 0, 1)
+        mask = viewpoint_cam.mask[..., None].cuda().float().permute(2, 0, 1)
         assert mask.shape[1] == image.shape[1] and mask.shape[2] == image.shape[2]
-        image = image * mask
-        gt_image = gt_image * mask
 
         # Loss computation
         losses = {}
 
         lambda_lpips = 0.
+        is_pseudo_view = getattr(viewpoint_cam, "is_pseudo", False)
 
-        if iteration > opt_params["lpips_linear_start"]:
-            lambda_lpips = (iteration - opt_params["lpips_linear_start"]) / (opt_params["lpips_linear_end"] - opt_params["lpips_linear_start"]) * opt_params["lambda_lpips_end"]
-            lambda_lpips = min(lambda_lpips, opt_params["lambda_lpips_end"])
-            losses['lpips'] = opt_params["w_lpips"] * lambda_lpips * lpips(image, gt_image)
-        else:
+        if is_pseudo_view:
+            pseudo_weight = float(getattr(viewpoint_cam, "pseudo_weight", 1.0))
+            pseudo_weight *= linear_warmup_scale(
+                iteration,
+                back_start_iter,
+                back_warmup_iters,
+                back_end_iter,
+            )
+
+            masked_image = image * mask
+            masked_gt_image = gt_image * mask
+            losses['back_rgb'] = masked_l1_loss(image, gt_image, mask) * lambda_back_rgb * pseudo_weight
+            losses['back_lpips'] = lpips(masked_image[None], masked_gt_image[None]).mean() * lambda_back_lpips * pseudo_weight
+            losses['back_sil'] = l1_loss(alpha, mask) * lambda_back_sil * pseudo_weight
+            losses['l1'] = torch.tensor(0., device="cuda")
+            losses['ssim'] = torch.tensor(0., device="cuda")
             losses['lpips'] = torch.tensor(0., device="cuda")
+        else:
+            image = image * mask
+            gt_image = gt_image * mask
 
-        losses['l1'] = l1_loss(image, gt_image) * (1.0 - opt_params["lambda_dssim"]) * (1.0 - lambda_lpips)
-        losses['ssim'] = (1.0 - ssim(image, gt_image)) * opt_params["lambda_dssim"] * (1.0 - lambda_lpips)
+            if iteration > opt_params["lpips_linear_start"]:
+                lambda_lpips = (iteration - opt_params["lpips_linear_start"]) / (opt_params["lpips_linear_end"] - opt_params["lpips_linear_start"]) * opt_params["lambda_lpips_end"]
+                lambda_lpips = min(lambda_lpips, opt_params["lambda_lpips_end"])
+                losses['lpips'] = opt_params["w_lpips"] * lambda_lpips * lpips(image, gt_image)
+            else:
+                losses['lpips'] = torch.tensor(0., device="cuda")
+
+            losses['l1'] = l1_loss(image, gt_image) * (1.0 - opt_params["lambda_dssim"]) * (1.0 - lambda_lpips)
+            losses['ssim'] = (1.0 - ssim(image, gt_image)) * opt_params["lambda_dssim"] * (1.0 - lambda_lpips)
+            losses['real_rgb'] = losses['l1'] + losses['ssim']
 
         if opt_params["metric_xyz"]:
             losses['xyz'] = F.relu((gaussians._xyz*gaussians.face_scaling[gaussians.binding])[visibility_filter] - opt_params["threshold_xyz"]).norm(dim=1).mean() * opt_params["lambda_xyz"]
@@ -166,7 +304,8 @@ def training(
         if opt_params["lambda_neck"] != 0:
             losses['neck'] = gaussians.compute_neck_loss() * opt_params["lambda_neck"]
         
-        losses['total'] = sum([v for k, v in losses.items()])
+        log_only_losses = {"real_rgb"}
+        losses['total'] = sum([v for k, v in losses.items() if k not in log_only_losses])
         losses['total'].backward()
 
         iter_end.record()
@@ -186,8 +325,13 @@ def training(
                     postfix["dy_off"] = f"{losses['dy_off']:.{7}f}"
                 if 'lap' in losses:
                     postfix["lap"] = f"{losses['lap']:.{7}f}"
+                if 'back_rgb' in losses:
+                    postfix["back_rgb"] = f"{losses['back_rgb']:.{7}f}"
+                if 'back_sil' in losses:
+                    postfix["back_sil"] = f"{losses['back_sil']:.{7}f}"
                 if 'dynamic_offset_std' in losses:
                     postfix["dynamic_offset_std"] = f"{losses['dynamic_offset_std']:.{7}f}"
+                postfix["pseudo"] = pseudo_sample_count
                 progress_bar.set_postfix(postfix)
                 progress_bar.update(10)
             if iteration == opt_params["iterations"]:
@@ -198,6 +342,7 @@ def training(
                 tb_writer, 
                 iteration, 
                 losses, 
+                {"pseudo_sample_count": pseudo_sample_count},
                 iter_start.elapsed_time(iter_end), 
                 testing_iterations, 
                 scene, 
@@ -206,11 +351,29 @@ def training(
                 lpips,
             )
 
+            if enable_pseudo_back and iteration in testing_iterations:
+                save_pseudo_back_visualizations(
+                    scene,
+                    render,
+                    background,
+                    iteration,
+                    Path(model_path),
+                    tb_writer,
+                )
+
             # Densification
             if iteration < opt_params["densify_until_iter"]:
                 # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                allow_pseudo_densify = (
+                    not is_pseudo_view
+                    or (
+                        pseudo_back_densify_start_iter >= 0
+                        and iteration >= pseudo_back_densify_start_iter
+                    )
+                )
+                if allow_pseudo_densify:
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt_params["densify_from_iter"] and iteration % opt_params["densification_interval"] == 0:
                     size_threshold = 20 if iteration > opt_params["opacity_reset_interval"] else None
@@ -228,10 +391,49 @@ def training(
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 
+def save_pseudo_back_visualizations(
+    scene: Scene,
+    renderFunc,
+    background,
+    iteration,
+    model_path: Path,
+    tb_writer=None,
+):
+    pseudo_cameras = [
+        camera for camera in scene.train_cameras[1.0]
+        if getattr(camera, "is_pseudo", False) and getattr(camera, "is_back_view", False)
+    ]
+    if len(pseudo_cameras) == 0:
+        return
+
+    output_dir = model_path / "pseudo_back_vis" / f"iter_{iteration:06d}"
+    scene.gaussians.eval()
+    for camera in pseudo_cameras:
+        viewpoint = CameraDataset([camera])[0]
+        if scene.gaussians.binding != None:
+            scene.gaussians.select_mesh_by_timestep(viewpoint.timestep)
+
+        render_pkg = renderFunc(viewpoint, scene.gaussians, background)
+        image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+        alpha = torch.clamp(render_pkg["alpha"], 0.0, 1.0)
+        mask = viewpoint.mask.cuda().float()[None]
+        name = str(getattr(viewpoint, "image_name", f"pseudo_{viewpoint.uid}"))
+
+        save_tensor_image(image, output_dir / f"{name}_render.png")
+        save_tensor_image(alpha, output_dir / f"{name}_alpha.png")
+        save_tensor_image(mask, output_dir / f"{name}_mask.png")
+
+        if tb_writer:
+            tb_writer.add_images(f"pseudo_back/{name}_render", image[None], global_step=iteration)
+            tb_writer.add_images(f"pseudo_back/{name}_alpha", alpha[None], global_step=iteration)
+            tb_writer.add_images(f"pseudo_back/{name}_mask", mask[None], global_step=iteration)
+
+
 def training_report(
     tb_writer, 
     iteration, 
     losses, 
+    extra_logs,
     elapsed, 
     testing_iterations, 
     scene: Scene, 
@@ -240,10 +442,20 @@ def training_report(
     lpips: LPIPS,
 ):
     if tb_writer and iteration % 10 == 0:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', losses['l1'].detach().item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/ssim_loss', losses['ssim'].detach().item(), iteration)
+        if 'l1' in losses:
+            tb_writer.add_scalar('train_loss_patches/l1_loss', losses['l1'].detach().item(), iteration)
+        if 'ssim' in losses:
+            tb_writer.add_scalar('train_loss_patches/ssim_loss', losses['ssim'].detach().item(), iteration)
         if 'lpips' in losses:
             tb_writer.add_scalar('train_loss_patches/lpips', losses['lpips'].detach().item(), iteration)
+        if 'real_rgb' in losses:
+            tb_writer.add_scalar('train_loss_patches/loss_real_rgb', losses['real_rgb'].detach().item(), iteration)
+        if 'back_rgb' in losses:
+            tb_writer.add_scalar('train_loss_patches/loss_back_rgb', losses['back_rgb'].detach().item(), iteration)
+        if 'back_lpips' in losses:
+            tb_writer.add_scalar('train_loss_patches/loss_back_lpips', losses['back_lpips'].detach().item(), iteration)
+        if 'back_sil' in losses:
+            tb_writer.add_scalar('train_loss_patches/loss_back_sil', losses['back_sil'].detach().item(), iteration)
         if 'xyz' in losses:
             tb_writer.add_scalar('train_loss_patches/xyz_loss', losses['xyz'].detach().item(), iteration)
         if 'scale' in losses:
@@ -259,6 +471,7 @@ def training_report(
         if 'dynamic_offset_std' in losses:
             tb_writer.add_scalar('train_loss_patches/dynamic_offset_std', losses['dynamic_offset_std'].detach().item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', losses['total'].detach().item(), iteration)
+        tb_writer.add_scalar('train/pseudo_sample_count', extra_logs.get("pseudo_sample_count", 0), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report test and samples of training set
@@ -346,6 +559,21 @@ if __name__ == "__main__":
     parser.add_argument("--load_existing_checkpoint", type=int, default=None,
                         help="Whether to load existing (newest) checkpoint in model_path")
     parser.add_argument("--config_path", type=str, default = None)
+    parser.add_argument("--enable_pseudo_back", action="store_true", default=False,
+                        help="Enable pseudo back-view frames during training.")
+    parser.add_argument("--pseudo_back_json", type=str, default=None,
+                        help="Path to pseudo_back_frames.json. If omitted, dataset reader will try to auto-discover it.")
+    parser.add_argument("--lambda_back_rgb", type=float, default=0.3)
+    parser.add_argument("--lambda_back_lpips", type=float, default=0.02)
+    parser.add_argument("--lambda_back_sil", type=float, default=0.2)
+    parser.add_argument("--back_start_iter", type=int, default=10000)
+    parser.add_argument("--back_end_iter", type=int, default=-1)
+    parser.add_argument("--back_warmup_iters", type=int, default=10000,
+                        help="Linearly ramp pseudo-back sampling and loss weights after back_start_iter.")
+    parser.add_argument("--back_sample_ratio", type=float, default=0.10,
+                        help="Maximum pseudo-frame sampling probability after warmup.")
+    parser.add_argument("--pseudo_back_densify_start_iter", type=int, default=-1,
+                        help="Iteration after which pseudo-back views can contribute densification stats. -1 disables it.")
     args = parser.parse_args()
 
     print("Loading config from", args.config_path)
@@ -377,6 +605,16 @@ if __name__ == "__main__":
         args.test_iterations, 
         args.checkpoint_iterations, 
         args.load_existing_checkpoint, 
+        args.enable_pseudo_back,
+        args.pseudo_back_json,
+        args.lambda_back_rgb,
+        args.lambda_back_lpips,
+        args.lambda_back_sil,
+        args.back_start_iter,
+        args.back_end_iter,
+        args.back_warmup_iters,
+        args.back_sample_ratio,
+        args.pseudo_back_densify_start_iter,
     )
 
     # All done
