@@ -12,6 +12,7 @@
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 import json
+import math
 import os
 import random
 import shutil
@@ -96,53 +97,133 @@ def validate_source_vector(name, values, source_paths, require_positive_sum=Fals
     return values
 
 
-def build_source_sampling_weights(cameras, source_sampling_probabilities):
-    if source_sampling_probabilities is None:
+def parse_timestep_ranges(values):
+    """Parse inclusive timestep ranges such as ``841:910`` or ``841``."""
+    if not values:
+        return []
+    ranges = []
+    for raw_value in values:
+        for value in str(raw_value).split(","):
+            value = value.strip()
+            if not value:
+                continue
+            if ":" in value:
+                start_raw, end_raw = value.split(":", 1)
+                start, end = int(start_raw), int(end_raw)
+            else:
+                start = end = int(value)
+            if start < 0 or end < start:
+                raise ValueError(
+                    "Motion target timestep ranges must satisfy 0 <= start <= end; "
+                    f"got {value!r}."
+                )
+            ranges.append((start, end))
+    ranges.sort()
+    merged = []
+    for start, end in ranges:
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def timestep_in_ranges(timestep, ranges):
+    timestep = int(timestep)
+    return any(int(start) <= timestep <= int(end) for start, end in ranges)
+
+
+def build_source_sampling_weights(
+    cameras,
+    source_sampling_probabilities,
+    target_timestep_ranges=None,
+    target_sampling_probability=None,
+):
+    if source_sampling_probabilities is None and target_sampling_probability is None:
         return None, None, None
 
-    probabilities = torch.as_tensor(source_sampling_probabilities, dtype=torch.float64)
-    if probabilities.ndim != 1 or probabilities.numel() == 0:
-        raise ValueError("source_sampling_probabilities must be a non-empty 1D sequence.")
-    if not torch.isfinite(probabilities).all() or (probabilities < 0).any():
-        raise ValueError("source_sampling_probabilities must be finite and non-negative.")
-    if probabilities.sum() <= 0:
-        raise ValueError("source_sampling_probabilities must contain a positive value.")
-    probabilities = probabilities / probabilities.sum()
-    counts = torch.zeros(len(probabilities), dtype=torch.long)
-    source_ids = []
-    for camera in cameras:
-        source_id = getattr(camera, "source_id", None)
-        if source_id is None or not 0 <= int(source_id) < len(probabilities):
-            raise ValueError(
-                "Source-balanced sampling requires every real camera to have a valid source_id; "
-                f"got source_id={source_id!r}."
-            )
-        source_id = int(source_id)
-        source_ids.append(source_id)
-        counts[source_id] += 1
+    probabilities = None
+    counts = None
+    if source_sampling_probabilities is None:
+        weights = torch.ones(len(cameras), dtype=torch.float64)
+    else:
+        probabilities = torch.as_tensor(source_sampling_probabilities, dtype=torch.float64)
+        if probabilities.ndim != 1 or probabilities.numel() == 0:
+            raise ValueError("source_sampling_probabilities must be a non-empty 1D sequence.")
+        if not torch.isfinite(probabilities).all() or (probabilities < 0).any():
+            raise ValueError("source_sampling_probabilities must be finite and non-negative.")
+        if probabilities.sum() <= 0:
+            raise ValueError("source_sampling_probabilities must contain a positive value.")
+        probabilities = probabilities / probabilities.sum()
+        counts = torch.zeros(len(probabilities), dtype=torch.long)
+        source_ids = []
+        for camera in cameras:
+            source_id = getattr(camera, "source_id", None)
+            if source_id is None or not 0 <= int(source_id) < len(probabilities):
+                raise ValueError(
+                    "Source-balanced sampling requires every real camera to have a valid source_id; "
+                    f"got source_id={source_id!r}."
+                )
+            source_id = int(source_id)
+            source_ids.append(source_id)
+            counts[source_id] += 1
 
-    missing = [
-        idx for idx, (probability, count) in enumerate(zip(probabilities, counts))
-        if probability > 0 and count == 0
-    ]
-    if missing:
-        raise ValueError(
-            "Positive source sampling probability was assigned to a source with no training cameras: "
-            + ", ".join(str(idx) for idx in missing)
+        missing = [
+            idx for idx, (probability, count) in enumerate(zip(probabilities, counts))
+            if probability > 0 and count == 0
+        ]
+        if missing:
+            raise ValueError(
+                "Positive source sampling probability was assigned to a source with no training cameras: "
+                + ", ".join(str(idx) for idx in missing)
+            )
+        weights = torch.tensor(
+            [float(probabilities[source_id] / counts[source_id]) for source_id in source_ids],
+            dtype=torch.float64,
         )
 
-    weights = torch.tensor(
-        [float(probabilities[source_id] / counts[source_id]) for source_id in source_ids],
-        dtype=torch.float64,
-    )
+    if target_sampling_probability is not None:
+        target_sampling_probability = float(target_sampling_probability)
+        if not 0.0 <= target_sampling_probability <= 1.0:
+            raise ValueError("target_sampling_probability must be in [0, 1].")
+        if not target_timestep_ranges:
+            raise ValueError(
+                "target_sampling_probability requires at least one target timestep range."
+            )
+        target_mask = torch.tensor(
+            [
+                timestep_in_ranges(camera.timestep, target_timestep_ranges)
+                for camera in cameras
+            ],
+            dtype=torch.bool,
+        )
+        target_mass = weights[target_mask].sum()
+        other_mass = weights[~target_mask].sum()
+        if target_sampling_probability > 0.0 and target_mass <= 0:
+            raise ValueError("No training cameras fall inside the motion target timestep ranges.")
+        if target_sampling_probability < 1.0 and other_mass <= 0:
+            raise ValueError("Motion target timestep ranges include every training camera.")
+        if target_mass > 0:
+            weights[target_mask] *= target_sampling_probability / target_mass
+        if other_mass > 0:
+            weights[~target_mask] *= (1.0 - target_sampling_probability) / other_mass
     return weights, probabilities, counts
 
 
-def make_camera_loader(cameras, source_sampling_probabilities, seed, num_workers):
+def make_camera_loader(
+    cameras,
+    source_sampling_probabilities,
+    seed,
+    num_workers,
+    target_timestep_ranges=None,
+    target_sampling_probability=None,
+):
     dataset = CameraDataset(cameras)
     weights, probabilities, counts = build_source_sampling_weights(
         cameras,
         source_sampling_probabilities,
+        target_timestep_ranges,
+        target_sampling_probability,
     )
     loader_kwargs = {
         "batch_size": None,
@@ -177,6 +258,340 @@ def source_value_for_camera(camera, values, default=1.0):
 def masked_l1_loss(network_output, gt, mask):
     denom = mask.sum().clamp_min(1.) * network_output.shape[0]
     return (torch.abs(network_output - gt) * mask).sum() / denom
+
+
+def masked_patch_l1_errors(network_output, gt, mask, grid_size, min_pixels):
+    """Return normalized foreground L1 for each cell in a generic image grid."""
+    grid_size = int(grid_size)
+    if grid_size < 1:
+        raise ValueError("motion image patch grid must be at least 1.")
+    if network_output.ndim != 3 or gt.shape != network_output.shape:
+        raise ValueError(
+            "Patch L1 expects matching [C,H,W] images, got "
+            f"prediction={tuple(network_output.shape)} target={tuple(gt.shape)}"
+        )
+    if mask.ndim != 3 or mask.shape[0] != 1 or mask.shape[-2:] != gt.shape[-2:]:
+        raise ValueError(f"Patch L1 expects mask [1,H,W], got {tuple(mask.shape)}")
+
+    pixel_error = torch.abs(network_output - gt).mean(dim=0, keepdim=True)[None]
+    mask_4d = mask[None].to(device=pixel_error.device, dtype=pixel_error.dtype)
+    pooled_mask = F.adaptive_avg_pool2d(mask_4d, (grid_size, grid_size))
+    pooled_error = F.adaptive_avg_pool2d(
+        pixel_error * mask_4d,
+        (grid_size, grid_size),
+    ) / pooled_mask.clamp_min(1e-8)
+    approximate_patch_area = (
+        float(gt.shape[-2] * gt.shape[-1]) / float(grid_size * grid_size)
+    )
+    valid = pooled_mask * approximate_patch_area >= float(min_pixels)
+    return pooled_error.flatten(), valid.flatten()
+
+
+def compute_motion_image_condition_losses(
+    aligned_image,
+    zero_image,
+    wrong_image,
+    gt_image,
+    rank_margin,
+    mask=None,
+    patch_grid=1,
+    patch_weight=0.0,
+    patch_min_pixels=32.0,
+    patch_hard_fraction=0.0,
+    patch_hard_weight=0.0,
+):
+    """Image-space causal terms without encouraging the wrong render to become worse."""
+    aligned_error = l1_loss(aligned_image, gt_image)
+    zero_error = l1_loss(zero_image.detach(), gt_image)
+    wrong_error = l1_loss(wrong_image, gt_image)
+    comparator_error = torch.minimum(zero_error, wrong_error.detach())
+    global_rank_violation = F.relu(
+        aligned_error - comparator_error + float(rank_margin)
+    )
+    global_wrong_zero_error = l1_loss(wrong_image, zero_image.detach())
+    rank_violation = global_rank_violation
+    wrong_zero_error = global_wrong_zero_error
+    patch_reconstruction = aligned_error
+    patch_logs = {
+        "motion_image/patch_weight": 0.0,
+        "motion_image/valid_patch_count": 0.0,
+        "motion_image/patch_rank_violation": 0.0,
+        "motion_image/patch_aligned_l1": float(aligned_error.detach().cpu()),
+        "motion_image/patch_gain_over_zero": float(
+            (zero_error - aligned_error.detach()).cpu()
+        ),
+        "motion_image/patch_fraction_better_zero": float(
+            (aligned_error.detach() < zero_error).float().cpu()
+        ),
+        "motion_image/patch_hard_fraction": 0.0,
+        "motion_image/patch_hard_weight": 0.0,
+        "motion_image/patch_hard_count": 0.0,
+        "motion_image/patch_hard_rank_violation": 0.0,
+        "motion_image/patch_hard_aligned_l1": float(aligned_error.detach().cpu()),
+    }
+
+    patch_weight = float(patch_weight)
+    if patch_weight > 0.0:
+        if mask is None:
+            raise ValueError("Patch image ranking requires a foreground mask.")
+        patch_weight = min(max(patch_weight, 0.0), 1.0)
+        aligned_patches, valid = masked_patch_l1_errors(
+            aligned_image,
+            gt_image,
+            mask,
+            patch_grid,
+            patch_min_pixels,
+        )
+        zero_patches, _ = masked_patch_l1_errors(
+            zero_image.detach(),
+            gt_image,
+            mask,
+            patch_grid,
+            patch_min_pixels,
+        )
+        wrong_patches, _ = masked_patch_l1_errors(
+            wrong_image,
+            gt_image,
+            mask,
+            patch_grid,
+            patch_min_pixels,
+        )
+        wrong_zero_patches, _ = masked_patch_l1_errors(
+            wrong_image,
+            zero_image.detach(),
+            mask,
+            patch_grid,
+            patch_min_pixels,
+        )
+        if bool(valid.any()):
+            aligned_valid = aligned_patches[valid]
+            zero_valid = zero_patches[valid]
+            wrong_valid = wrong_patches[valid]
+            comparator_valid = torch.minimum(
+                zero_valid,
+                wrong_valid.detach(),
+            )
+            patch_rank_violations = F.relu(
+                aligned_valid - comparator_valid + float(rank_margin)
+            )
+            mean_patch_rank_violation = patch_rank_violations.mean()
+            mean_patch_reconstruction = aligned_valid.mean()
+            patch_hard_fraction = min(max(float(patch_hard_fraction), 0.0), 1.0)
+            patch_hard_weight = min(max(float(patch_hard_weight), 0.0), 1.0)
+            hard_count = max(
+                1,
+                min(
+                    int(aligned_valid.numel()),
+                    int(math.ceil(aligned_valid.numel() * patch_hard_fraction)),
+                ),
+            )
+            if patch_hard_fraction > 0.0 and patch_hard_weight > 0.0:
+                hard_patch_rank_violation = torch.topk(
+                    patch_rank_violations,
+                    hard_count,
+                ).values.mean()
+                hard_patch_reconstruction = torch.topk(
+                    aligned_valid,
+                    hard_count,
+                ).values.mean()
+                patch_rank_violation = (
+                    (1.0 - patch_hard_weight) * mean_patch_rank_violation
+                    + patch_hard_weight * hard_patch_rank_violation
+                )
+                patch_reconstruction = (
+                    (1.0 - patch_hard_weight) * mean_patch_reconstruction
+                    + patch_hard_weight * hard_patch_reconstruction
+                )
+            else:
+                hard_count = 0
+                hard_patch_rank_violation = mean_patch_rank_violation
+                hard_patch_reconstruction = mean_patch_reconstruction
+                patch_rank_violation = mean_patch_rank_violation
+                patch_reconstruction = mean_patch_reconstruction
+            patch_wrong_zero_error = wrong_zero_patches[valid].mean()
+            rank_violation = (
+                (1.0 - patch_weight) * global_rank_violation
+                + patch_weight * patch_rank_violation
+            )
+            wrong_zero_error = (
+                (1.0 - patch_weight) * global_wrong_zero_error
+                + patch_weight * patch_wrong_zero_error
+            )
+            patch_logs = {
+                "motion_image/patch_weight": patch_weight,
+                "motion_image/valid_patch_count": float(valid.sum().detach().cpu()),
+                "motion_image/patch_rank_violation": float(
+                    patch_rank_violation.detach().cpu()
+                ),
+                "motion_image/patch_aligned_l1": float(
+                    patch_reconstruction.detach().cpu()
+                ),
+                "motion_image/patch_gain_over_zero": float(
+                    (zero_valid.detach() - aligned_valid.detach()).mean().cpu()
+                ),
+                "motion_image/patch_fraction_better_zero": float(
+                    (aligned_valid.detach() < zero_valid.detach()).float().mean().cpu()
+                ),
+                "motion_image/patch_hard_fraction": patch_hard_fraction,
+                "motion_image/patch_hard_weight": patch_hard_weight,
+                "motion_image/patch_hard_count": float(hard_count),
+                "motion_image/patch_hard_rank_violation": float(
+                    hard_patch_rank_violation.detach().cpu()
+                ),
+                "motion_image/patch_hard_aligned_l1": float(
+                    hard_patch_reconstruction.detach().cpu()
+                ),
+            }
+    logs = {
+        "motion_image/aligned_l1": float(aligned_error.detach().cpu()),
+        "motion_image/zero_l1": float(zero_error.detach().cpu()),
+        "motion_image/wrong_l1": float(wrong_error.detach().cpu()),
+        "motion_image/aligned_gain_over_zero": float(
+            (zero_error - aligned_error.detach()).cpu()
+        ),
+        "motion_image/aligned_gain_over_wrong": float(
+            (wrong_error.detach() - aligned_error.detach()).cpu()
+        ),
+        "motion_image/rank_violation": float(rank_violation.detach().cpu()),
+        "motion_image/global_rank_violation": float(
+            global_rank_violation.detach().cpu()
+        ),
+        "motion_image/wrong_zero_l1": float(wrong_zero_error.detach().cpu()),
+        **patch_logs,
+    }
+    return rank_violation, wrong_zero_error, patch_reconstruction, logs
+
+
+def masked_image_detail_error(network_output, gt, mask, laplacian_weight=0.5):
+    """Foreground-interior gradient and Laplacian error for identity-agnostic detail."""
+    if network_output.shape != gt.shape or network_output.ndim != 3:
+        raise ValueError(
+            "Detail loss expects matching [C,H,W] tensors, got "
+            f"prediction={tuple(network_output.shape)} target={tuple(gt.shape)}"
+        )
+    if mask.ndim != 3 or mask.shape[0] != 1 or mask.shape[-2:] != gt.shape[-2:]:
+        raise ValueError(f"Detail loss expects mask [1,H,W], got {tuple(mask.shape)}")
+
+    mask = mask.to(device=network_output.device, dtype=network_output.dtype)
+    channels = float(network_output.shape[0])
+    dx_error = torch.abs(
+        (network_output[:, :, 1:] - network_output[:, :, :-1])
+        - (gt[:, :, 1:] - gt[:, :, :-1])
+    )
+    dy_error = torch.abs(
+        (network_output[:, 1:, :] - network_output[:, :-1, :])
+        - (gt[:, 1:, :] - gt[:, :-1, :])
+    )
+    mask_x = mask[:, :, 1:] * mask[:, :, :-1]
+    mask_y = mask[:, 1:, :] * mask[:, :-1, :]
+    gradient_x = (dx_error * mask_x).sum() / (mask_x.sum() * channels).clamp_min(1e-8)
+    gradient_y = (dy_error * mask_y).sum() / (mask_y.sum() * channels).clamp_min(1e-8)
+    gradient_error = 0.5 * (gradient_x + gradient_y)
+
+    kernel = network_output.new_tensor(
+        [[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]]
+    ).view(1, 1, 3, 3)
+    kernel = kernel.expand(network_output.shape[0], 1, 3, 3)
+    output_laplacian = F.conv2d(
+        network_output[None], kernel, padding=1, groups=network_output.shape[0]
+    )[0]
+    gt_laplacian = F.conv2d(
+        gt[None], kernel, padding=1, groups=gt.shape[0]
+    )[0]
+    interior_mask = 1.0 - F.max_pool2d(1.0 - mask[None], 3, stride=1, padding=1)[0]
+    interior_mask = interior_mask.clamp(0.0, 1.0)
+    laplacian_error = (
+        torch.abs(output_laplacian - gt_laplacian) * interior_mask
+    ).sum() / (interior_mask.sum() * channels).clamp_min(1e-8)
+    total = gradient_error + float(laplacian_weight) * laplacian_error
+    return total, gradient_error, laplacian_error
+
+
+def compute_motion_image_detail_losses(
+    aligned_image,
+    zero_image,
+    wrong_image,
+    gt_image,
+    mask,
+    rank_margin=0.0,
+    laplacian_weight=0.5,
+):
+    aligned_detail, aligned_gradient, aligned_laplacian = masked_image_detail_error(
+        aligned_image,
+        gt_image,
+        mask,
+        laplacian_weight=laplacian_weight,
+    )
+    zero_detail, _, _ = masked_image_detail_error(
+        zero_image.detach(),
+        gt_image,
+        mask,
+        laplacian_weight=laplacian_weight,
+    )
+    wrong_detail, _, _ = masked_image_detail_error(
+        wrong_image,
+        gt_image,
+        mask,
+        laplacian_weight=laplacian_weight,
+    )
+    comparator_detail = torch.minimum(zero_detail, wrong_detail.detach())
+    detail_rank = F.relu(
+        aligned_detail - comparator_detail + float(rank_margin)
+    )
+    logs = {
+        "motion_image/detail_aligned": float(aligned_detail.detach().cpu()),
+        "motion_image/detail_zero": float(zero_detail.detach().cpu()),
+        "motion_image/detail_wrong": float(wrong_detail.detach().cpu()),
+        "motion_image/detail_gradient_aligned": float(aligned_gradient.detach().cpu()),
+        "motion_image/detail_laplacian_aligned": float(aligned_laplacian.detach().cpu()),
+        "motion_image/detail_gain_over_zero": float(
+            (zero_detail - aligned_detail.detach()).cpu()
+        ),
+        "motion_image/detail_rank_violation": float(detail_rank.detach().cpu()),
+        "motion_image/detail_laplacian_weight": float(laplacian_weight),
+    }
+    return aligned_detail, detail_rank, logs
+
+
+def render_motion_counterfactual_images(
+    viewpoint_camera,
+    gaussians,
+    render_func,
+    background,
+):
+    """Render zero and expression-matched wrong conditions before the aligned pass."""
+    feature_dtype = gaussians._xyz.dtype
+    feature_device = gaussians._xyz.device
+    wrong_feature = gaussians.sample_mismatched_motion_feature_for_timestep(
+        viewpoint_camera.timestep,
+        feature_device,
+        feature_dtype,
+    )
+    if wrong_feature is None:
+        return None
+    zero_feature = torch.zeros_like(wrong_feature)
+    gaussians.set_motion_auxiliary_pass(True)
+    try:
+        with torch.no_grad():
+            gaussians.set_motion_feature_override(zero_feature)
+            gaussians.select_mesh_by_timestep(viewpoint_camera.timestep)
+            zero_image = render_func(
+                viewpoint_camera,
+                gaussians,
+                background,
+            )["render"].detach()
+
+        gaussians.set_motion_feature_override(wrong_feature)
+        gaussians.select_mesh_by_timestep(viewpoint_camera.timestep)
+        wrong_image = render_func(
+            viewpoint_camera,
+            gaussians,
+            background,
+        )["render"]
+    finally:
+        gaussians.clear_motion_feature_override()
+        gaussians.set_motion_auxiliary_pass(False)
+    return zero_image, wrong_image
 
 
 def make_region_projector(gaussians, opt_params):
@@ -516,6 +931,83 @@ def training(
     iter_camera_pseudo = None
     realized_source_probabilities = None
     real_source_counts = None
+    target_timestep_ranges = opt_params.get("motion_target_timestep_ranges", [])
+    target_sampling_probability = opt_params.get(
+        "motion_target_sampling_probability",
+        None,
+    )
+    target_regularizer_scale = float(
+        opt_params.get("motion_target_regularizer_scale", 1.0)
+    )
+    lambda_motion_image_ranking = float(
+        opt_params.get("lambda_motion_image_ranking", 0.0)
+    )
+    lambda_motion_image_mismatch = float(
+        opt_params.get("lambda_motion_image_mismatch_suppression", 0.0)
+    )
+    lambda_motion_image_patch_reconstruction = float(
+        opt_params.get("lambda_motion_image_patch_reconstruction", 0.0)
+    )
+    lambda_motion_image_detail_reconstruction = float(
+        opt_params.get("lambda_motion_image_detail_reconstruction", 0.0)
+    )
+    lambda_motion_image_detail_ranking = float(
+        opt_params.get("lambda_motion_image_detail_ranking", 0.0)
+    )
+    lambda_motion_zero_teacher = float(
+        opt_params.get("lambda_motion_zero_teacher", 0.0)
+    )
+    motion_zero_teacher_unscaled = bool(
+        opt_params.get("motion_zero_teacher_unscaled", False)
+    )
+    lambda_motion_attention_selectivity = float(
+        opt_params.get("lambda_motion_attention_selectivity", 0.0)
+    )
+    lambda_motion_attention_balance = float(
+        opt_params.get("lambda_motion_attention_balance", 0.0)
+    )
+    motion_attention_entropy_target = float(
+        opt_params.get("motion_attention_entropy_target", 0.72)
+    )
+    motion_image_rank_margin = float(
+        opt_params.get("motion_image_ranking_margin", 0.0)
+    )
+    motion_image_interval = int(
+        opt_params.get("motion_image_condition_interval", 1)
+    )
+    motion_image_start_iter = int(
+        opt_params.get("motion_image_condition_start_iter", 0)
+    )
+    motion_image_warmup_iters = int(
+        opt_params.get("motion_image_condition_warmup_iters", 0)
+    )
+    motion_image_patch_grid = int(opt_params.get("motion_image_patch_grid", 1))
+    motion_image_patch_weight = float(
+        opt_params.get("motion_image_patch_weight", 0.0)
+    )
+    motion_image_patch_min_pixels = float(
+        opt_params.get("motion_image_patch_min_pixels", 32.0)
+    )
+    motion_image_patch_hard_fraction = float(
+        opt_params.get("motion_image_patch_hard_fraction", 0.0)
+    )
+    motion_image_patch_hard_weight = float(
+        opt_params.get("motion_image_patch_hard_weight", 0.0)
+    )
+    motion_image_detail_laplacian_weight = float(
+        opt_params.get("motion_image_detail_laplacian_weight", 0.5)
+    )
+    motion_image_attention_only_gradient = bool(
+        opt_params.get("motion_image_attention_only_gradient", False)
+    )
+    motion_image_enabled = (
+        lambda_motion_image_ranking > 0.0
+        or lambda_motion_image_mismatch > 0.0
+        or lambda_motion_image_patch_reconstruction > 0.0
+        or lambda_motion_image_detail_reconstruction > 0.0
+        or lambda_motion_image_detail_ranking > 0.0
+    )
+    target_sample_count = 0
 
     if enable_pseudo_back:
         train_cameras = scene.train_cameras[1.0]
@@ -545,6 +1037,8 @@ def training(
             source_sampling_probabilities,
             seed=opt_params.get("seed", 0),
             num_workers=8,
+            target_timestep_ranges=target_timestep_ranges,
+            target_sampling_probability=target_sampling_probability,
         )
         iter_camera_real = iter(loader_camera_real)
 
@@ -566,6 +1060,8 @@ def training(
             source_sampling_probabilities,
             seed=opt_params.get("seed", 0),
             num_workers=8,
+            target_timestep_ranges=target_timestep_ranges,
+            target_sampling_probability=target_sampling_probability,
         )
         iter_camera_train = iter(loader_camera_train)
 
@@ -582,11 +1078,54 @@ def training(
                 f"train_count={int(real_source_counts[idx])}",
                 f"target_probability={float(realized_source_probabilities[idx]):.6f}",
             )
+    if target_timestep_ranges:
+        available_target_count = sum(
+            timestep_in_ranges(camera.timestep, target_timestep_ranges)
+            for camera in train_cameras
+            if not getattr(camera, "is_pseudo", False)
+        )
+        print(
+            "Motion target-frame policy:",
+            f"ranges={target_timestep_ranges}",
+            f"train_count={available_target_count}",
+            f"sampling_probability={target_sampling_probability}",
+            f"regularizer_scale={target_regularizer_scale}",
+        )
     if source_regularizer_scales is not None:
         print(
             "Per-source deformation regularizer scales:",
             source_regularizer_scales,
             "(applies to laplacian, relative_deform, motion_residual_l2, motion_residual_lap)",
+        )
+    if motion_image_enabled:
+        print(
+            "Motion image-space causal losses:",
+            f"global_rank={lambda_motion_image_ranking}",
+            f"wrong_to_zero={lambda_motion_image_mismatch}",
+            f"patch_reconstruction={lambda_motion_image_patch_reconstruction}",
+            f"patch_grid={motion_image_patch_grid}",
+            f"patch_mix={motion_image_patch_weight}",
+            f"patch_min_pixels={motion_image_patch_min_pixels}",
+            f"patch_hard_fraction={motion_image_patch_hard_fraction}",
+            f"patch_hard_weight={motion_image_patch_hard_weight}",
+            f"detail_reconstruction={lambda_motion_image_detail_reconstruction}",
+            f"detail_ranking={lambda_motion_image_detail_ranking}",
+            f"detail_laplacian_weight={motion_image_detail_laplacian_weight}",
+            f"attention_only_gradient={motion_image_attention_only_gradient}",
+            f"interval={motion_image_interval}",
+        )
+    if lambda_motion_attention_selectivity > 0.0 or lambda_motion_attention_balance > 0.0:
+        print(
+            "Motion attention regularization:",
+            f"selectivity={lambda_motion_attention_selectivity}",
+            f"token_balance={lambda_motion_attention_balance}",
+            f"entropy_target_ratio={motion_attention_entropy_target}",
+        )
+    if lambda_motion_zero_teacher > 0.0:
+        print(
+            "Motion zero-teacher:",
+            f"weight={lambda_motion_zero_teacher}",
+            f"ignore_target_regularizer_scale={motion_zero_teacher_unscaled}",
         )
 
     ema_loss_for_log = 0.0
@@ -604,7 +1143,11 @@ def training(
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if (
-            not getattr(gaussians, "motion_cross_attention_adapter_only", False)
+            not (
+                getattr(gaussians, "motion_cross_attention_adapter_only", False)
+                or getattr(gaussians, "motion_cross_attention_selective_unfreeze", False)
+                or getattr(gaussians, "motion_cross_attention_detail_unfreeze", False)
+            )
             and iteration % opt_params["sh_warmup_iterations"] == 0
         ):
             gaussians.oneupSHdegree()
@@ -631,13 +1174,44 @@ def training(
 
         is_pseudo_view = getattr(viewpoint_cam, "is_pseudo", False)
         source_id = getattr(viewpoint_cam, "source_id", None)
+        is_motion_target = (
+            not is_pseudo_view
+            and (
+                not target_timestep_ranges
+                or timestep_in_ranges(viewpoint_cam.timestep, target_timestep_ranges)
+            )
+        )
         if not is_pseudo_view and source_id is not None:
             source_sample_counts[int(source_id)] += 1
+        if is_motion_target and target_timestep_ranges:
+            target_sample_count += 1
         deformation_regularizer_scale = source_value_for_camera(
             viewpoint_cam,
             source_regularizer_scales,
             default=1.0,
         )
+        if is_motion_target and target_timestep_ranges:
+            deformation_regularizer_scale *= target_regularizer_scale
+
+        motion_image_weight_scale = linear_warmup_scale(
+            iteration,
+            motion_image_start_iter,
+            motion_image_warmup_iters,
+        )
+        run_motion_image_condition = (
+            motion_image_enabled
+            and is_motion_target
+            and motion_image_weight_scale > 0.0
+            and iteration % motion_image_interval == 0
+        )
+        counterfactual_images = None
+        if run_motion_image_condition:
+            counterfactual_images = render_motion_counterfactual_images(
+                viewpoint_cam,
+                gaussians,
+                render,
+                background,
+            )
 
         # Set timestep and run FLAME model
         if gaussians.binding != None:
@@ -662,7 +1236,9 @@ def training(
 
         # Loss computation
         losses = {}
+        routed_condition_losses = {}
         region_logs = {}
+        motion_image_logs = {}
         motion_residual_ratio_value = None
 
         lambda_lpips = 0.
@@ -759,6 +1335,19 @@ def training(
                 * lambda_motion_mismatch_suppression
             )
 
+        if lambda_motion_zero_teacher != 0:
+            zero_teacher_scale = (
+                1.0 if motion_zero_teacher_unscaled else deformation_regularizer_scale
+            )
+            losses['motion_zero_teacher'] = (
+                gaussians.compute_motion_zero_teacher_loss()
+                * lambda_motion_zero_teacher
+                * zero_teacher_scale
+            )
+            motion_image_logs["motion_image/zero_teacher_effective_scale"] = float(
+                zero_teacher_scale
+            )
+
         if opt_params["lambda_relative_deform"] != 0:
             losses['deform'] = (
                 gaussians.compute_relative_deformation_loss()
@@ -771,6 +1360,39 @@ def training(
 
         if opt_params["lambda_neck"] != 0:
             losses['neck'] = gaussians.compute_neck_loss() * opt_params["lambda_neck"]
+
+        if (
+            lambda_motion_attention_selectivity > 0.0
+            or lambda_motion_attention_balance > 0.0
+        ):
+            attention_selectivity, attention_balance = (
+                gaussians.compute_motion_attention_regularization(
+                    motion_attention_entropy_target
+                )
+            )
+            if lambda_motion_attention_selectivity > 0.0:
+                losses["motion_attention_selectivity"] = (
+                    attention_selectivity
+                    * lambda_motion_attention_selectivity
+                    * motion_image_weight_scale
+                )
+            if lambda_motion_attention_balance > 0.0:
+                losses["motion_attention_balance"] = (
+                    attention_balance
+                    * lambda_motion_attention_balance
+                    * motion_image_weight_scale
+                )
+            motion_image_logs.update(
+                {
+                    "motion_image/attention_selectivity_raw": float(
+                        attention_selectivity.detach().cpu()
+                    ),
+                    "motion_image/attention_balance_raw": float(
+                        attention_balance.detach().cpu()
+                    ),
+                    "motion_image/attention_entropy_target": motion_attention_entropy_target,
+                }
+            )
         
         calibration_interval = int(opt_params.get("region_calibration_interval", 0))
         if calibration_interval > 0 and iteration % calibration_interval == 0 and not is_pseudo_view:
@@ -797,9 +1419,126 @@ def training(
                 if r > 0.0:
                     region_logs["region/calibration/recommended_lambda_region"] = target_ratio * g / r
 
-        log_only_losses = {"real_rgb", "region_total"}
+        if counterfactual_images is not None:
+            zero_image, wrong_image = counterfactual_images
+            zero_image = zero_image * mask
+            wrong_image = wrong_image * mask
+            rank_violation, wrong_zero_error, patch_reconstruction, image_condition_logs = (
+                compute_motion_image_condition_losses(
+                    image,
+                    zero_image,
+                    wrong_image,
+                    gt_image,
+                    motion_image_rank_margin,
+                    mask=mask,
+                    patch_grid=motion_image_patch_grid,
+                    patch_weight=motion_image_patch_weight,
+                    patch_min_pixels=motion_image_patch_min_pixels,
+                    patch_hard_fraction=motion_image_patch_hard_fraction,
+                    patch_hard_weight=motion_image_patch_hard_weight,
+                )
+            )
+            motion_image_logs.update(image_condition_logs)
+            if lambda_motion_image_ranking > 0.0:
+                losses['motion_image_rank'] = (
+                    rank_violation
+                    * lambda_motion_image_ranking
+                    * motion_image_weight_scale
+                )
+                if motion_image_attention_only_gradient:
+                    routed_condition_losses['motion_image_rank'] = losses['motion_image_rank']
+            if lambda_motion_image_mismatch > 0.0:
+                losses['motion_image_mismatch'] = (
+                    wrong_zero_error
+                    * lambda_motion_image_mismatch
+                    * motion_image_weight_scale
+                )
+                if motion_image_attention_only_gradient:
+                    routed_condition_losses['motion_image_mismatch'] = losses['motion_image_mismatch']
+            if lambda_motion_image_patch_reconstruction > 0.0:
+                losses['motion_image_patch_recon'] = (
+                    patch_reconstruction
+                    * lambda_motion_image_patch_reconstruction
+                    * motion_image_weight_scale
+                )
+            if (
+                lambda_motion_image_detail_reconstruction > 0.0
+                or lambda_motion_image_detail_ranking > 0.0
+            ):
+                detail_reconstruction, detail_rank, detail_logs = (
+                    compute_motion_image_detail_losses(
+                        image,
+                        zero_image,
+                        wrong_image,
+                        gt_image,
+                        mask,
+                        rank_margin=motion_image_rank_margin,
+                        laplacian_weight=motion_image_detail_laplacian_weight,
+                    )
+                )
+                motion_image_logs.update(detail_logs)
+                if lambda_motion_image_detail_reconstruction > 0.0:
+                    losses['motion_image_detail_recon'] = (
+                        detail_reconstruction
+                        * lambda_motion_image_detail_reconstruction
+                        * motion_image_weight_scale
+                    )
+                if lambda_motion_image_detail_ranking > 0.0:
+                    losses['motion_image_detail_rank'] = (
+                        detail_rank
+                        * lambda_motion_image_detail_ranking
+                        * motion_image_weight_scale
+                    )
+                    if motion_image_attention_only_gradient:
+                        routed_condition_losses['motion_image_detail_rank'] = (
+                            losses['motion_image_detail_rank']
+                        )
+            motion_image_logs.update(
+                {
+                    "motion_image/active": 1.0,
+                    "motion_image/weight_scale": motion_image_weight_scale,
+                    "motion_image/is_target_frame": float(is_motion_target),
+                }
+            )
+
+        log_only_losses = {"real_rgb", "region_total", *routed_condition_losses.keys()}
         losses['total'] = sum([v for k, v in losses.items() if k not in log_only_losses])
+
+        routed_gradients = []
+        routed_parameters = []
+        if routed_condition_losses:
+            routed_parameters = gaussians.get_cross_attention_trainable_parameters()
+            if not routed_parameters:
+                raise RuntimeError(
+                    "Attention-only image gradient routing found no trainable cross-attention parameters."
+                )
+            routed_loss = sum(routed_condition_losses.values())
+            routed_gradients = torch.autograd.grad(
+                routed_loss,
+                routed_parameters,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            routed_grad_norm_sq = sum(
+                float(gradient.detach().square().sum().cpu())
+                for gradient in routed_gradients
+                if gradient is not None
+            )
+            motion_image_logs.update(
+                {
+                    "motion_image/attention_only_gradient": 1.0,
+                    "motion_image/routed_loss": float(routed_loss.detach().cpu()),
+                    "motion_image/routed_attention_grad_norm": routed_grad_norm_sq ** 0.5,
+                }
+            )
         losses['total'].backward()
+        for param, gradient in zip(routed_parameters, routed_gradients):
+            if gradient is None:
+                continue
+            if param.grad is None:
+                param.grad = gradient.detach()
+            else:
+                param.grad.add_(gradient.detach())
 
         condition_monitor_logs = {}
         if condition_monitor_interval > 0 and iteration % condition_monitor_interval == 0:
@@ -814,6 +1553,27 @@ def training(
                     )
                 )
             if condition_monitor_logs:
+                causal_prefix = f"condition/{gaussians.motion_condition_mode}"
+                causal_keys = tuple(
+                    f"{causal_prefix}/{suffix}"
+                    for suffix in (
+                        "feature_common_energy_ratio",
+                        "current_raw_rms",
+                        "current_centered_rms",
+                        "mismatch_index",
+                        "mismatch_flame_distance",
+                        "mismatch_condition_cosine",
+                        "delta_actual_rms",
+                        "base_actual_rms",
+                        "delta_over_base_rms",
+                        "mismatch_delta_actual_rms",
+                        "mismatch_over_base_rms",
+                        "aligned_over_mismatch_rms",
+                        "nodeform_delta_actual_max_abs",
+                        "zero_teacher_delta_rms",
+                        "zero_teacher_relative_rms",
+                    )
+                )
                 monitor_preview = {
                     key: condition_monitor_logs[key]
                     for key in (
@@ -830,25 +1590,35 @@ def training(
                         "condition/cross_attention/base_pretrain_active",
                         "condition/cross_attention/base_lr_scale",
                         "condition/cross_attention/condition_lr_scale",
+                        "condition/cross_attention/decoder_lr_scale",
                         "condition/cross_attention/adapter_only",
+                        "condition/cross_attention/selective_unfreeze",
+                        "condition/cross_attention/detail_unfreeze",
+                        "condition/cross_attention/decoder_tail_param_count",
+                        "condition/cross_attention/decoder_param_count",
+                        "condition/cross_attention/decoder_scope_full",
+                        "condition/cross_attention/gaussian_lr_scale",
+                        "condition/cross_attention/gaussian_trainable_param_count",
+                        "condition/cross_attention/detail_total_param_count",
+                        "condition/cross_attention/attention_lr",
+                        "condition/cross_attention/attention_grad_norm",
+                        "condition/cross_attention/decoder_lr",
+                        "condition/cross_attention/decoder_grad_norm",
+                        "condition/cross_attention/gaussian_xyz_lr",
+                        "condition/cross_attention/gaussian_xyz_grad_norm",
+                        "condition/cross_attention/gaussian_f_dc_lr",
+                        "condition/cross_attention/gaussian_f_dc_grad_norm",
+                        "condition/cross_attention/gaussian_f_rest_lr",
+                        "condition/cross_attention/gaussian_f_rest_grad_norm",
+                        "condition/cross_attention/gaussian_opacity_lr",
+                        "condition/cross_attention/gaussian_scaling_lr",
+                        "condition/cross_attention/gaussian_rotation_lr",
                         "condition/cross_attention_v3/delta_actual_mean_abs",
                         "condition/cross_attention_v3/delta_actual_rms",
                         "condition/cross_attention_v3/base_actual_rms",
                         "condition/cross_attention_v3/delta_over_base_rms",
                         "condition/cross_attention_v3/nodeform_delta_actual_max_abs",
-                        "condition/cross_attention_v4/feature_common_energy_ratio",
-                        "condition/cross_attention_v4/current_raw_rms",
-                        "condition/cross_attention_v4/current_centered_rms",
-                        "condition/cross_attention_v4/mismatch_index",
-                        "condition/cross_attention_v4/mismatch_flame_distance",
-                        "condition/cross_attention_v4/mismatch_condition_cosine",
-                        "condition/cross_attention_v4/delta_actual_rms",
-                        "condition/cross_attention_v4/base_actual_rms",
-                        "condition/cross_attention_v4/delta_over_base_rms",
-                        "condition/cross_attention_v4/mismatch_delta_actual_rms",
-                        "condition/cross_attention_v4/mismatch_over_base_rms",
-                        "condition/cross_attention_v4/aligned_over_mismatch_rms",
-                        "condition/cross_attention_v4/nodeform_delta_actual_max_abs",
+                        *causal_keys,
                         "condition/cross_attention/scale_1x/skip_cross_attention_c128/gate",
                         "condition/cross_attention/scale_1x/skip_cross_attention_c128/logit_scale",
                         "condition/cross_attention/scale_1x/skip_cross_attention_c128/attention_entropy_mean",
@@ -861,6 +1631,11 @@ def training(
                         "condition/cross_attention/scale_1x/decoder_cross_attention_c64/gate",
                         "condition/cross_attention/scale_1x/decoder_cross_attention_c64/attention_entropy_mean",
                         "condition/cross_attention/scale_1x/decoder_cross_attention_c64/token_grad_norm",
+                        "condition/cross_attention/outermost/pre_output_cross_attention_c128/gate",
+                        "condition/cross_attention/outermost/pre_output_cross_attention_c128/active_condition_fraction",
+                        "condition/cross_attention/outermost/pre_output_cross_attention_c128/active_attention_entropy_ratio",
+                        "condition/cross_attention/outermost/pre_output_cross_attention_c128/active_token_balance_loss",
+                        "condition/cross_attention/outermost/pre_output_cross_attention_c128/token_grad_norm",
                         "condition/cross_attention/outermost/output_cross_attention_c3/gate",
                         "condition/cross_attention/outermost/output_cross_attention_c3/attention_entropy_mean",
                         "condition/cross_attention/outermost/output_cross_attention_c3/token_grad_norm",
@@ -907,6 +1682,38 @@ def training(
             "regularizer/lambda_motion_mismatch_suppression": float(
                 lambda_motion_mismatch_suppression
             ),
+            "regularizer/lambda_motion_zero_teacher": lambda_motion_zero_teacher,
+            "regularizer/motion_zero_teacher_unscaled": float(
+                motion_zero_teacher_unscaled
+            ),
+            "regularizer/lambda_motion_image_ranking": lambda_motion_image_ranking,
+            "regularizer/lambda_motion_image_mismatch": lambda_motion_image_mismatch,
+            "regularizer/lambda_motion_image_patch_reconstruction": (
+                lambda_motion_image_patch_reconstruction
+            ),
+            "regularizer/lambda_motion_image_detail_reconstruction": (
+                lambda_motion_image_detail_reconstruction
+            ),
+            "regularizer/lambda_motion_image_detail_ranking": (
+                lambda_motion_image_detail_ranking
+            ),
+            "regularizer/motion_image_attention_only_gradient": float(
+                motion_image_attention_only_gradient
+            ),
+            "regularizer/lambda_motion_attention_selectivity": (
+                lambda_motion_attention_selectivity
+            ),
+            "regularizer/lambda_motion_attention_balance": (
+                lambda_motion_attention_balance
+            ),
+            "source_sampling/motion_target_count": float(target_sample_count),
+            "source_sampling/motion_target_fraction": (
+                target_sample_count / real_sample_total if real_sample_total > 0 else 0.0
+            ),
+            "source_sampling/motion_target_probability": (
+                float(target_sampling_probability)
+                if target_sampling_probability is not None else -1.0
+            ),
         }
         for idx, count in enumerate(source_sample_counts):
             source_logs[f"source_sampling/source_{idx}_count"] = count
@@ -919,7 +1726,7 @@ def training(
                 )
         source_log_interval = int(opt_params.get("region_log_interval", 100))
         if (
-            realized_source_probabilities is not None
+            (realized_source_probabilities is not None or target_timestep_ranges)
             and source_log_interval > 0
             and iteration % source_log_interval == 0
         ):
@@ -955,6 +1762,20 @@ def training(
                     postfix["motion_res_lap"] = f"{losses['motion_res_lap']:.{7}f}"
                 if 'motion_mismatch' in losses:
                     postfix["motion_mismatch"] = f"{losses['motion_mismatch']:.{7}f}"
+                if 'motion_zero_teacher' in losses:
+                    postfix["zero_teacher"] = f"{losses['motion_zero_teacher']:.{7}f}"
+                if 'motion_image_rank' in losses:
+                    postfix["image_rank"] = f"{losses['motion_image_rank']:.{7}f}"
+                if 'motion_image_mismatch' in losses:
+                    postfix["image_wrong"] = f"{losses['motion_image_mismatch']:.{7}f}"
+                if 'motion_image_patch_recon' in losses:
+                    postfix["patch_recon"] = f"{losses['motion_image_patch_recon']:.{7}f}"
+                if 'motion_image_detail_recon' in losses:
+                    postfix["detail_recon"] = f"{losses['motion_image_detail_recon']:.{7}f}"
+                if 'motion_image_detail_rank' in losses:
+                    postfix["detail_rank"] = f"{losses['motion_image_detail_rank']:.{7}f}"
+                if 'motion_attention_selectivity' in losses:
+                    postfix["attn_select"] = f"{losses['motion_attention_selectivity']:.{7}f}"
                 if 'region_total' in losses:
                     postfix["region"] = f"{losses['region_total']:.{7}f}"
                 if 'back_rgb' in losses:
@@ -979,6 +1800,7 @@ def training(
                     **source_logs,
                     **condition_monitor_logs,
                     **region_logs,
+                    **motion_image_logs,
                 },
                 iter_start.elapsed_time(iter_end), 
                 testing_iterations, 
@@ -1000,7 +1822,11 @@ def training(
 
             # Densification
             if (
-                not getattr(gaussians, "motion_cross_attention_adapter_only", False)
+                not (
+                    getattr(gaussians, "motion_cross_attention_adapter_only", False)
+                    or getattr(gaussians, "motion_cross_attention_selective_unfreeze", False)
+                    or getattr(gaussians, "motion_cross_attention_detail_unfreeze", False)
+                )
                 and iteration < opt_params["densify_until_iter"]
             ):
                 # Keep track of max radii in image-space for pruning
@@ -1231,6 +2057,23 @@ def training_report(
             tb_writer.add_scalar('train_loss_patches/motion_res_l2', losses['motion_res_l2'].detach().item(), iteration)
         if 'motion_res_lap' in losses:
             tb_writer.add_scalar('train_loss_patches/motion_res_lap', losses['motion_res_lap'].detach().item(), iteration)
+        for key in (
+            "motion_mismatch",
+            "motion_zero_teacher",
+            "motion_image_rank",
+            "motion_image_mismatch",
+            "motion_image_patch_recon",
+            "motion_image_detail_recon",
+            "motion_image_detail_rank",
+            "motion_attention_selectivity",
+            "motion_attention_balance",
+        ):
+            if key in losses:
+                tb_writer.add_scalar(
+                    f"train_loss_patches/{key}",
+                    losses[key].detach().item(),
+                    iteration,
+                )
         for key in ("region_mouth", "region_eyes", "region_brow", "region_cheeks", "region_total"):
             if key in losses:
                 tb_writer.add_scalar(f"train_loss_patches/{key}", losses[key].detach().item(), iteration)
@@ -1243,7 +2086,7 @@ def training_report(
         tb_writer.add_scalar('train_loss_patches/total_loss', losses['total'].detach().item(), iteration)
         tb_writer.add_scalar('train/pseudo_sample_count', extra_logs.get("pseudo_sample_count", 0), iteration)
         for key, value in extra_logs.items():
-            if key.startswith(("condition/", "region/", "source_sampling/", "regularizer/")):
+            if key.startswith(("condition/", "motion_image/", "region/", "source_sampling/", "regularizer/")):
                 tb_writer.add_scalar(key, float(value), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
@@ -1363,6 +2206,27 @@ if __name__ == "__main__":
             "motion residual L2/laplacian). Defaults to 1 for every source."
         ),
     )
+    parser.add_argument(
+        "--motion_target_timestep_ranges",
+        nargs="*",
+        default=None,
+        help=(
+            "Inclusive global timestep ranges for extracted target-video frames, for example "
+            "841:910. These frames can be oversampled and use weaker deformation regularization."
+        ),
+    )
+    parser.add_argument(
+        "--motion_target_sampling_probability",
+        type=float,
+        default=None,
+        help="Optional probability mass assigned to target-video timesteps by the camera sampler.",
+    )
+    parser.add_argument(
+        "--motion_target_regularizer_scale",
+        type=float,
+        default=1.0,
+        help="Multiplier for deformation regularizers on target-video timesteps only.",
+    )
     parser.add_argument('--model_path', type=str, 
                         help="Path to directory where the gaussian avatar model is saved.")
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
@@ -1430,6 +2294,7 @@ if __name__ == "__main__":
                             "cross_attention_v2",
                             "cross_attention_v3",
                             "cross_attention_v4",
+                            "cross_attention_v5",
                         ],
                         help="How to inject the 512-dim Xnemo condition into the deformation U-Net.")
     parser.add_argument("--motion_condition_layers", type=str, default="bottleneck",
@@ -1467,47 +2332,225 @@ if __name__ == "__main__":
     parser.add_argument("--motion_cross_attention_uv_noise_std", type=float, default=0.0,
                         help="Training-only Gaussian noise std added to the UV/expression U-Net input in cross_attention mode.")
     parser.add_argument("--motion_cross_attention_base_pretrain_iters", type=int, default=0,
-                        help="For cross_attention_v2/v3/v4, train the base U-Net with zero condition for this many iterations.")
+                        help="For cross_attention_v2/v3/v4/v5, train the base U-Net with zero condition for this many iterations.")
     parser.add_argument("--motion_cross_attention_base_lr_mult_after_pretrain", type=float, default=1.0,
-                        help="For cross_attention_v2/v3/v4, base U-Net LR multiplier after base pretraining; use 0 to freeze it.")
+                        help="For cross_attention_v2/v3/v4/v5, base U-Net LR multiplier after base pretraining; use 0 to freeze it.")
     parser.add_argument("--motion_cross_attention_condition_warmup_iters", type=int, default=0,
-                        help="For cross_attention_v2/v3/v4, linearly warm up cross-attention LR after base pretraining.")
+                        help="For cross_attention_v2/v3/v4/v5, linearly warm up cross-attention LR after base pretraining.")
     parser.add_argument("--motion_cross_attention_adapter_only", action="store_true", default=False,
-                        help="For cross_attention_v2/v3/v4, freeze all initialized non-attention parameters and disable densification.")
+                        help="For cross_attention_v2/v3/v4/v5, freeze all initialized non-attention parameters and disable densification.")
+    parser.add_argument(
+        "--motion_cross_attention_selective_unfreeze",
+        action="store_true",
+        default=False,
+        help=(
+            "For cross_attention_v4/v5, train attention plus scale_2x/scale_1x decoder upsampling "
+            "and the deformation output head; freeze Gaussian identity and the rest of the U-Net."
+        ),
+    )
+    parser.add_argument(
+        "--motion_cross_attention_detail_unfreeze",
+        action="store_true",
+        default=False,
+        help=(
+            "For cross_attention_v4/v5 checkpoint fine-tuning, stage attention, every decoder "
+            "up block, and low-LR Gaussian appearance/geometry while keeping the encoder, neck, "
+            "and Gaussian topology frozen."
+        ),
+    )
+    parser.add_argument(
+        "--motion_cross_attention_decoder_lr_mult",
+        type=float,
+        default=0.1,
+        help="LR multiplier for the decoder scope selected by the unfreeze profile.",
+    )
+    parser.add_argument(
+        "--motion_cross_attention_decoder_start_iter",
+        type=int,
+        default=0,
+        help="Keep the selected shared decoder scope frozen through this iteration while attention learns first.",
+    )
+    parser.add_argument(
+        "--motion_cross_attention_decoder_warmup_iters",
+        type=int,
+        default=0,
+        help="Linearly warm the selected shared decoder LR after decoder_start_iter.",
+    )
+    parser.add_argument(
+        "--motion_cross_attention_gaussian_start_iter",
+        type=int,
+        default=4000,
+        help="Keep Gaussian appearance/geometry frozen through this detail-unfreeze iteration.",
+    )
+    parser.add_argument(
+        "--motion_cross_attention_gaussian_warmup_iters",
+        type=int,
+        default=2000,
+        help="Linearly warm low-LR Gaussian fine-tuning after gaussian_start_iter.",
+    )
+    parser.add_argument("--motion_cross_attention_gaussian_xyz_lr_mult", type=float, default=0.01,
+                        help="Detail-unfreeze multiplier for the scheduled Gaussian xyz LR.")
+    parser.add_argument("--motion_cross_attention_gaussian_feature_lr_mult", type=float, default=0.05,
+                        help="Detail-unfreeze multiplier for Gaussian DC and higher-order SH LRs.")
+    parser.add_argument("--motion_cross_attention_gaussian_opacity_lr_mult", type=float, default=0.01,
+                        help="Detail-unfreeze multiplier for Gaussian opacity LR.")
+    parser.add_argument("--motion_cross_attention_gaussian_scaling_lr_mult", type=float, default=0.02,
+                        help="Detail-unfreeze multiplier for Gaussian scaling LR.")
+    parser.add_argument("--motion_cross_attention_gaussian_rotation_lr_mult", type=float, default=0.02,
+                        help="Detail-unfreeze multiplier for Gaussian rotation LR.")
     parser.add_argument(
         "--motion_cross_attention_centering",
         type=str,
         default="training_mean",
         choices=["none", "training_mean"],
-        help="For cross_attention_v4, remove the checkpointed training-set common 512 component while preserving exact zero512.",
+        help="For cross_attention_v4/v5, remove the checkpointed training-set common 512 component while preserving exact zero512.",
     )
     parser.add_argument(
         "--motion_cross_attention_mismatch_candidates",
         type=int,
         default=16,
-        help="Number of FLAME-nearest candidates considered when selecting a wrong-frame 512 for cross_attention_v4.",
+        help="Number of FLAME-nearest candidates considered when selecting a wrong-frame 512 for cross_attention_v4/v5.",
     )
     parser.add_argument(
         "--motion_cross_attention_mismatch_selection",
         type=str,
         default="flame_nearest",
         choices=["random", "flame_nearest"],
-        help="Wrong-frame selection policy for cross_attention_v4 causal suppression.",
+        help="Wrong-frame selection policy for cross_attention_v4/v5 causal suppression.",
     )
     parser.add_argument("--lambda_motion_residual_l2", type=float, default=0.0,
                         help="L2 regularization weight for the condition residual branch output.")
     parser.add_argument("--lambda_motion_residual_lap", type=float, default=0.0,
                         help="Laplacian smoothness weight for the condition residual branch output.")
     parser.add_argument("--lambda_motion_residual_ratio", type=float, default=0.0,
-                        help="Soft-ceiling loss weight for the actual condition residual RMS divided by frozen-base RMS (cross_attention_v3/v4).")
+                        help="Soft-ceiling loss weight for the actual condition residual RMS divided by frozen-base RMS (cross_attention_v3/v4/v5).")
     parser.add_argument("--motion_residual_ratio_limit", type=float, default=0.35,
-                        help="Unpenalized actual condition/base RMS ratio for cross_attention_v3/v4.")
+                        help="Unpenalized actual condition/base RMS ratio for cross_attention_v3/v4/v5.")
     parser.add_argument(
         "--lambda_motion_mismatch_suppression",
         type=float,
         default=0.0,
-        help="For cross_attention_v4, suppress deformation caused by an expression-matched wrong-frame 512 relative to the zero512 base path.",
+        help="For cross_attention_v4/v5, suppress deformation caused by an expression-matched wrong-frame 512 relative to the zero512 base path.",
     )
+    parser.add_argument(
+        "--lambda_motion_zero_teacher",
+        type=float,
+        default=0.0,
+        help="Preserve the initialized zero512 deformation path while unfreezing shared decoder blocks.",
+    )
+    parser.add_argument(
+        "--motion_zero_teacher_unscaled",
+        action="store_true",
+        default=False,
+        help="Do not weaken zero-teacher distillation on target frames whose geometric regularizers are relaxed.",
+    )
+    parser.add_argument(
+        "--lambda_motion_image_ranking",
+        type=float,
+        default=0.0,
+        help="Target-frame image-space hinge requiring aligned512 to beat zero512 and wrong512.",
+    )
+    parser.add_argument(
+        "--lambda_motion_image_mismatch_suppression",
+        type=float,
+        default=0.0,
+        help="Target-frame image-space loss that keeps an expression-matched wrong512 render near zero512.",
+    )
+    parser.add_argument(
+        "--lambda_motion_image_patch_reconstruction",
+        type=float,
+        default=0.0,
+        help="Equal-patch foreground reconstruction weight on target frames; it is spatially generic, not region named.",
+    )
+    parser.add_argument(
+        "--lambda_motion_image_detail_reconstruction",
+        type=float,
+        default=0.0,
+        help="Generic foreground-interior gradient/Laplacian reconstruction weight on target frames.",
+    )
+    parser.add_argument(
+        "--lambda_motion_image_detail_ranking",
+        type=float,
+        default=0.0,
+        help="Require aligned512 to beat zero/wrong512 in generic gradient/Laplacian detail error.",
+    )
+    parser.add_argument(
+        "--motion_image_patch_grid",
+        type=int,
+        default=1,
+        help="Grid width/height for generic spatial causal ranking; 1 preserves the historical global loss.",
+    )
+    parser.add_argument(
+        "--motion_image_patch_weight",
+        type=float,
+        default=0.0,
+        help="Mix of patch-wise versus global image ranking and wrong-condition suppression in [0,1].",
+    )
+    parser.add_argument(
+        "--motion_image_patch_min_pixels",
+        type=float,
+        default=32.0,
+        help="Minimum foreground-mask mass required for a grid cell to enter patch losses.",
+    )
+    parser.add_argument(
+        "--motion_image_patch_hard_fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of highest-loss valid patches used for generic hard-patch mining; 0 disables it.",
+    )
+    parser.add_argument(
+        "--motion_image_patch_hard_weight",
+        type=float,
+        default=0.0,
+        help="Mix weight of hard-patch versus all-patch ranking/reconstruction in [0,1].",
+    )
+    parser.add_argument(
+        "--motion_image_detail_laplacian_weight",
+        type=float,
+        default=0.5,
+        help="Laplacian contribution inside the generic image-detail error.",
+    )
+    parser.add_argument(
+        "--motion_image_attention_only_gradient",
+        action="store_true",
+        default=False,
+        help=(
+            "Route image-space causal ranking/mismatch gradients only to cross-attention, so "
+            "shared decoder/Gaussian parameters cannot satisfy them by improving every condition."
+        ),
+    )
+    parser.add_argument(
+        "--lambda_motion_attention_selectivity",
+        type=float,
+        default=0.0,
+        help="Penalize active-condition attention entropy above the configured target ratio.",
+    )
+    parser.add_argument(
+        "--lambda_motion_attention_balance",
+        type=float,
+        default=0.0,
+        help="Keep condition-token usage balanced globally while per-query attention becomes selective.",
+    )
+    parser.add_argument(
+        "--motion_attention_entropy_target",
+        type=float,
+        default=0.72,
+        help="Maximum desired active attention entropy divided by log(num_tokens).",
+    )
+    parser.add_argument(
+        "--motion_image_ranking_margin",
+        type=float,
+        default=5e-4,
+        help="Required aligned L1 advantage in the image-space ranking loss.",
+    )
+    parser.add_argument(
+        "--motion_image_condition_interval",
+        type=int,
+        default=1,
+        help="Run the two extra counterfactual renders every N eligible target-frame steps.",
+    )
+    parser.add_argument("--motion_image_condition_start_iter", type=int, default=0)
+    parser.add_argument("--motion_image_condition_warmup_iters", type=int, default=0)
     parser.add_argument("--motion_feature_align", type=str, default="strict",
                         choices=["strict", "interpolate", "truncate"],
                         help="How to handle a frame-count mismatch between motion features and FLAME timesteps.")
@@ -1557,8 +2600,13 @@ if __name__ == "__main__":
         "cross_attention_v2",
         "cross_attention_v3",
         "cross_attention_v4",
+        "cross_attention_v5",
     ):
         args.motion_condition_layers = "cross_attention"
+
+    args.motion_target_timestep_ranges = parse_timestep_ranges(
+        args.motion_target_timestep_ranges
+    )
 
     args.source_sampling_probabilities = validate_source_vector(
         "source_sampling_probabilities",
@@ -1607,6 +2655,48 @@ if __name__ == "__main__":
     opt_params["lambda_motion_mismatch_suppression"] = (
         args.lambda_motion_mismatch_suppression
     )
+    opt_params["lambda_motion_zero_teacher"] = args.lambda_motion_zero_teacher
+    opt_params["motion_zero_teacher_unscaled"] = args.motion_zero_teacher_unscaled
+    opt_params["lambda_motion_image_ranking"] = args.lambda_motion_image_ranking
+    opt_params["lambda_motion_image_mismatch_suppression"] = (
+        args.lambda_motion_image_mismatch_suppression
+    )
+    opt_params["lambda_motion_image_patch_reconstruction"] = (
+        args.lambda_motion_image_patch_reconstruction
+    )
+    opt_params["lambda_motion_image_detail_reconstruction"] = (
+        args.lambda_motion_image_detail_reconstruction
+    )
+    opt_params["lambda_motion_image_detail_ranking"] = (
+        args.lambda_motion_image_detail_ranking
+    )
+    opt_params["motion_image_patch_grid"] = args.motion_image_patch_grid
+    opt_params["motion_image_patch_weight"] = args.motion_image_patch_weight
+    opt_params["motion_image_patch_min_pixels"] = args.motion_image_patch_min_pixels
+    opt_params["motion_image_patch_hard_fraction"] = args.motion_image_patch_hard_fraction
+    opt_params["motion_image_patch_hard_weight"] = args.motion_image_patch_hard_weight
+    opt_params["motion_image_detail_laplacian_weight"] = (
+        args.motion_image_detail_laplacian_weight
+    )
+    opt_params["motion_image_attention_only_gradient"] = (
+        args.motion_image_attention_only_gradient
+    )
+    opt_params["lambda_motion_attention_selectivity"] = (
+        args.lambda_motion_attention_selectivity
+    )
+    opt_params["lambda_motion_attention_balance"] = (
+        args.lambda_motion_attention_balance
+    )
+    opt_params["motion_attention_entropy_target"] = (
+        args.motion_attention_entropy_target
+    )
+    opt_params["motion_image_ranking_margin"] = args.motion_image_ranking_margin
+    opt_params["motion_image_condition_interval"] = args.motion_image_condition_interval
+    opt_params["motion_image_condition_start_iter"] = args.motion_image_condition_start_iter
+    opt_params["motion_image_condition_warmup_iters"] = args.motion_image_condition_warmup_iters
+    opt_params["motion_target_timestep_ranges"] = args.motion_target_timestep_ranges
+    opt_params["motion_target_sampling_probability"] = args.motion_target_sampling_probability
+    opt_params["motion_target_regularizer_scale"] = args.motion_target_regularizer_scale
     opt_params["lambda_region"] = args.lambda_region
     opt_params["region_w_mouth"] = args.region_w_mouth
     opt_params["region_w_eyes"] = args.region_w_eyes
@@ -1632,6 +2722,8 @@ if __name__ == "__main__":
     if (
         args.init_checkpoint_path is not None
         and not args.motion_cross_attention_adapter_only
+        and not args.motion_cross_attention_selective_unfreeze
+        and not args.motion_cross_attention_detail_unfreeze
         and not args.disable_densification
     ):
         print(
@@ -1643,38 +2735,220 @@ if __name__ == "__main__":
             "cross_attention_v2",
             "cross_attention_v3",
             "cross_attention_v4",
+            "cross_attention_v5",
         ):
             raise ValueError(
                 "--motion_cross_attention_adapter_only requires --motion_condition_mode "
-                "cross_attention_v2, cross_attention_v3, or cross_attention_v4."
+                "cross_attention_v2, cross_attention_v3, cross_attention_v4, or cross_attention_v5."
             )
-        if args.init_checkpoint_path is None:
-            raise ValueError("--motion_cross_attention_adapter_only requires --init_checkpoint_path.")
+        if args.init_checkpoint_path is None and not args.load_existing_checkpoint:
+            raise ValueError(
+                "--motion_cross_attention_adapter_only requires --init_checkpoint_path "
+                "for a new run or --load_existing_checkpoint for resume."
+            )
         if args.motion_cross_attention_base_pretrain_iters != 0:
             raise ValueError("Adapter-only initialization requires --motion_cross_attention_base_pretrain_iters 0.")
+    optimization_profile_count = sum(
+        int(enabled)
+        for enabled in (
+            args.motion_cross_attention_adapter_only,
+            args.motion_cross_attention_selective_unfreeze,
+            args.motion_cross_attention_detail_unfreeze,
+        )
+    )
+    if optimization_profile_count > 1:
+        raise ValueError(
+            "Use only one of --motion_cross_attention_adapter_only, "
+            "--motion_cross_attention_selective_unfreeze, or "
+            "--motion_cross_attention_detail_unfreeze."
+        )
+    if args.motion_cross_attention_selective_unfreeze:
+        if args.motion_cross_attention_adapter_only or args.motion_cross_attention_detail_unfreeze:
+            raise ValueError(
+                "Selective unfreeze cannot be combined with another optimization profile."
+            )
+        if args.motion_condition_mode not in ("cross_attention_v4", "cross_attention_v5"):
+            raise ValueError(
+                "--motion_cross_attention_selective_unfreeze requires "
+                "--motion_condition_mode cross_attention_v4 or cross_attention_v5."
+            )
+        if args.init_checkpoint_path is None and not args.load_existing_checkpoint:
+            raise ValueError(
+                "--motion_cross_attention_selective_unfreeze requires "
+                "--init_checkpoint_path for a new run or --load_existing_checkpoint for resume."
+            )
+        if args.motion_cross_attention_base_pretrain_iters != 0:
+            raise ValueError(
+                "Selective unfreeze requires --motion_cross_attention_base_pretrain_iters 0."
+            )
+    if args.motion_cross_attention_detail_unfreeze:
+        if args.motion_condition_mode not in ("cross_attention_v4", "cross_attention_v5"):
+            raise ValueError(
+                "--motion_cross_attention_detail_unfreeze requires "
+                "--motion_condition_mode cross_attention_v4 or cross_attention_v5."
+            )
+        if args.init_checkpoint_path is None and not args.load_existing_checkpoint:
+            raise ValueError(
+                "--motion_cross_attention_detail_unfreeze requires --init_checkpoint_path "
+                "for a new run or --load_existing_checkpoint for resume."
+            )
+        if args.motion_cross_attention_base_pretrain_iters != 0:
+            raise ValueError(
+                "Detail unfreeze requires --motion_cross_attention_base_pretrain_iters 0."
+            )
+    if args.motion_cross_attention_decoder_lr_mult < 0.0:
+        raise ValueError("--motion_cross_attention_decoder_lr_mult must be non-negative.")
+    if args.motion_cross_attention_decoder_start_iter < 0:
+        raise ValueError("--motion_cross_attention_decoder_start_iter must be non-negative.")
+    if args.motion_cross_attention_decoder_warmup_iters < 0:
+        raise ValueError("--motion_cross_attention_decoder_warmup_iters must be non-negative.")
+    if args.motion_cross_attention_gaussian_start_iter < 0:
+        raise ValueError("--motion_cross_attention_gaussian_start_iter must be non-negative.")
+    if args.motion_cross_attention_gaussian_warmup_iters < 0:
+        raise ValueError("--motion_cross_attention_gaussian_warmup_iters must be non-negative.")
+    gaussian_lr_multipliers = (
+        args.motion_cross_attention_gaussian_xyz_lr_mult,
+        args.motion_cross_attention_gaussian_feature_lr_mult,
+        args.motion_cross_attention_gaussian_opacity_lr_mult,
+        args.motion_cross_attention_gaussian_scaling_lr_mult,
+        args.motion_cross_attention_gaussian_rotation_lr_mult,
+    )
+    if any(value < 0.0 for value in gaussian_lr_multipliers):
+        raise ValueError("Cross-attention Gaussian LR multipliers must be non-negative.")
+    if args.motion_cross_attention_detail_unfreeze and not any(
+        value > 0.0 for value in gaussian_lr_multipliers
+    ):
+        raise ValueError("Detail unfreeze requires at least one nonzero Gaussian LR multiplier.")
     if args.lambda_motion_residual_ratio < 0.0:
         raise ValueError("--lambda_motion_residual_ratio must be non-negative.")
     if args.motion_residual_ratio_limit < 0.0:
         raise ValueError("--motion_residual_ratio_limit must be non-negative.")
     if (
         args.lambda_motion_residual_ratio > 0.0
-        and args.motion_condition_mode not in ("cross_attention_v3", "cross_attention_v4")
+        and args.motion_condition_mode not in (
+            "cross_attention_v3",
+            "cross_attention_v4",
+            "cross_attention_v5",
+        )
     ):
         raise ValueError(
             "--lambda_motion_residual_ratio currently requires --motion_condition_mode "
-            "cross_attention_v3 or cross_attention_v4."
+            "cross_attention_v3, cross_attention_v4, or cross_attention_v5."
         )
     if args.lambda_motion_mismatch_suppression < 0.0:
         raise ValueError("--lambda_motion_mismatch_suppression must be non-negative.")
+    for name, value in (
+        ("lambda_motion_zero_teacher", args.lambda_motion_zero_teacher),
+        ("lambda_motion_image_ranking", args.lambda_motion_image_ranking),
+        (
+            "lambda_motion_image_mismatch_suppression",
+            args.lambda_motion_image_mismatch_suppression,
+        ),
+        (
+            "lambda_motion_image_patch_reconstruction",
+            args.lambda_motion_image_patch_reconstruction,
+        ),
+        (
+            "lambda_motion_image_detail_reconstruction",
+            args.lambda_motion_image_detail_reconstruction,
+        ),
+        (
+            "lambda_motion_image_detail_ranking",
+            args.lambda_motion_image_detail_ranking,
+        ),
+        (
+            "lambda_motion_attention_selectivity",
+            args.lambda_motion_attention_selectivity,
+        ),
+        ("lambda_motion_attention_balance", args.lambda_motion_attention_balance),
+        ("motion_image_ranking_margin", args.motion_image_ranking_margin),
+        ("motion_image_detail_laplacian_weight", args.motion_image_detail_laplacian_weight),
+        ("motion_target_regularizer_scale", args.motion_target_regularizer_scale),
+    ):
+        if value < 0.0:
+            raise ValueError(f"--{name} must be non-negative.")
+    if args.motion_image_condition_interval < 1:
+        raise ValueError("--motion_image_condition_interval must be at least 1.")
+    if args.motion_image_patch_grid < 1:
+        raise ValueError("--motion_image_patch_grid must be at least 1.")
+    if not 0.0 <= args.motion_image_patch_weight <= 1.0:
+        raise ValueError("--motion_image_patch_weight must be in [0, 1].")
+    if args.motion_image_patch_min_pixels <= 0.0:
+        raise ValueError("--motion_image_patch_min_pixels must be positive.")
+    if not 0.0 <= args.motion_image_patch_hard_fraction <= 1.0:
+        raise ValueError("--motion_image_patch_hard_fraction must be in [0, 1].")
+    if not 0.0 <= args.motion_image_patch_hard_weight <= 1.0:
+        raise ValueError("--motion_image_patch_hard_weight must be in [0, 1].")
+    if not 0.0 < args.motion_attention_entropy_target <= 1.0:
+        raise ValueError("--motion_attention_entropy_target must be in (0, 1].")
+    if args.motion_image_condition_start_iter < 0 or args.motion_image_condition_warmup_iters < 0:
+        raise ValueError("Motion image start/warmup iterations must be non-negative.")
+    if (
+        args.motion_target_sampling_probability is not None
+        and not 0.0 <= args.motion_target_sampling_probability <= 1.0
+    ):
+        raise ValueError("--motion_target_sampling_probability must be in [0, 1].")
+    if (
+        args.motion_target_sampling_probability is not None
+        and not args.motion_target_timestep_ranges
+    ):
+        raise ValueError(
+            "--motion_target_sampling_probability requires --motion_target_timestep_ranges."
+        )
+    image_condition_enabled = (
+        args.lambda_motion_image_ranking > 0.0
+        or args.lambda_motion_image_mismatch_suppression > 0.0
+        or args.lambda_motion_image_patch_reconstruction > 0.0
+        or args.lambda_motion_image_detail_reconstruction > 0.0
+        or args.lambda_motion_image_detail_ranking > 0.0
+    )
+    if image_condition_enabled and args.motion_condition_mode not in (
+        "cross_attention_v4",
+        "cross_attention_v5",
+    ):
+        raise ValueError("Motion image-space condition losses require cross_attention_v4/v5.")
+    if image_condition_enabled and not (
+        args.motion_cross_attention_adapter_only
+        or args.motion_cross_attention_selective_unfreeze
+        or args.motion_cross_attention_detail_unfreeze
+    ):
+        raise ValueError(
+            "Motion image-space condition losses require adapter-only, selective-unfreeze, "
+            "or detail-unfreeze checkpoint fine-tuning."
+        )
+    if args.lambda_motion_zero_teacher > 0.0 and not (
+        args.motion_cross_attention_selective_unfreeze
+        or args.motion_cross_attention_detail_unfreeze
+    ):
+        raise ValueError(
+            "--lambda_motion_zero_teacher requires selective-unfreeze or detail-unfreeze."
+        )
+    if args.motion_image_attention_only_gradient and not (
+        args.lambda_motion_image_ranking > 0.0
+        or args.lambda_motion_image_mismatch_suppression > 0.0
+        or args.lambda_motion_image_detail_ranking > 0.0
+    ):
+        raise ValueError(
+            "--motion_image_attention_only_gradient requires at least one image-space causal loss."
+        )
+    attention_regularization_enabled = (
+        args.lambda_motion_attention_selectivity > 0.0
+        or args.lambda_motion_attention_balance > 0.0
+    )
+    if attention_regularization_enabled and args.motion_condition_mode not in (
+        "cross_attention_v4",
+        "cross_attention_v5",
+    ):
+        raise ValueError("Motion attention regularization requires cross_attention_v4/v5.")
     if args.motion_cross_attention_mismatch_candidates < 1:
         raise ValueError("--motion_cross_attention_mismatch_candidates must be at least 1.")
     if (
         args.lambda_motion_mismatch_suppression > 0.0
-        and args.motion_condition_mode != "cross_attention_v4"
+        and args.motion_condition_mode not in ("cross_attention_v4", "cross_attention_v5")
     ):
         raise ValueError(
             "--lambda_motion_mismatch_suppression requires --motion_condition_mode "
-            "cross_attention_v4."
+            "cross_attention_v4 or cross_attention_v5."
         )
     if args.motion_feature_path is not None:
         validate_motion_feature_index(args.source_paths, args.motion_feature_path)
@@ -1702,9 +2976,46 @@ if __name__ == "__main__":
         model_params["motion_cross_attention_base_lr_mult_after_pretrain"] = args.motion_cross_attention_base_lr_mult_after_pretrain
         model_params["motion_cross_attention_condition_warmup_iters"] = args.motion_cross_attention_condition_warmup_iters
         model_params["motion_cross_attention_adapter_only"] = args.motion_cross_attention_adapter_only
+        model_params["motion_cross_attention_selective_unfreeze"] = (
+            args.motion_cross_attention_selective_unfreeze
+        )
+        model_params["motion_cross_attention_detail_unfreeze"] = (
+            args.motion_cross_attention_detail_unfreeze
+        )
+        model_params["motion_cross_attention_decoder_lr_mult"] = (
+            args.motion_cross_attention_decoder_lr_mult
+        )
+        model_params["motion_cross_attention_decoder_start_iter"] = (
+            args.motion_cross_attention_decoder_start_iter
+        )
+        model_params["motion_cross_attention_decoder_warmup_iters"] = (
+            args.motion_cross_attention_decoder_warmup_iters
+        )
+        model_params["motion_cross_attention_gaussian_start_iter"] = (
+            args.motion_cross_attention_gaussian_start_iter
+        )
+        model_params["motion_cross_attention_gaussian_warmup_iters"] = (
+            args.motion_cross_attention_gaussian_warmup_iters
+        )
+        model_params["motion_cross_attention_gaussian_xyz_lr_mult"] = (
+            args.motion_cross_attention_gaussian_xyz_lr_mult
+        )
+        model_params["motion_cross_attention_gaussian_feature_lr_mult"] = (
+            args.motion_cross_attention_gaussian_feature_lr_mult
+        )
+        model_params["motion_cross_attention_gaussian_opacity_lr_mult"] = (
+            args.motion_cross_attention_gaussian_opacity_lr_mult
+        )
+        model_params["motion_cross_attention_gaussian_scaling_lr_mult"] = (
+            args.motion_cross_attention_gaussian_scaling_lr_mult
+        )
+        model_params["motion_cross_attention_gaussian_rotation_lr_mult"] = (
+            args.motion_cross_attention_gaussian_rotation_lr_mult
+        )
         model_params["motion_cross_attention_centering"] = args.motion_cross_attention_centering
         model_params["motion_cross_attention_mismatch_enabled"] = (
             args.lambda_motion_mismatch_suppression > 0.0
+            or image_condition_enabled
         )
         model_params["motion_cross_attention_mismatch_candidates"] = (
             args.motion_cross_attention_mismatch_candidates

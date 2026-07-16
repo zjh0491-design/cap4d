@@ -57,6 +57,23 @@ def frames_to_video(
     output_path,
     fps,
 ):
+    encoder_listing = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    available_encoders = encoder_listing.stdout + encoder_listing.stderr
+    if "libx264" in available_encoders:
+        encoder_args = ["-c:v", "libx264", "-preset", "medium", "-crf", "18"]
+    elif "libopenh264" in available_encoders:
+        encoder_args = ["-c:v", "libopenh264", "-b:v", "8M"]
+    else:
+        raise RuntimeError(
+            "No browser-compatible H.264 encoder found in ffmpeg. "
+            "Install an ffmpeg build with libx264 or libopenh264."
+        )
+
     cmd = [
         "ffmpeg",
         "-y",
@@ -64,9 +81,10 @@ def frames_to_video(
         "-f", "image2",
         "-pattern_type", "glob",
         "-i", f"{frame_dir}/*.png",
-        "-crf", "18",
+        *encoder_args,
         "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
         f"{output_path}"
     ]
 
@@ -146,10 +164,10 @@ def render_sequence(args):
             f"sample_norms={sample_norms}",
             f"temporal_delta_mean={temporal_delta:.6f}",
         )
-        if gaussians.motion_condition_mode == "cross_attention_v4":
+        if gaussians.motion_condition_mode in ("cross_attention_v4", "cross_attention_v5"):
             centered_features = gaussians._condition_motion_feature(motion_features)
             print(
-                "Animation cross_attention_v4 preprocessing audit:",
+                f"Animation {gaussians.motion_condition_mode} preprocessing audit:",
                 f"center_source={gaussians.motion_feature_center_source}",
                 f"training_common_energy_ratio={gaussians.motion_feature_common_energy_ratio:.6f}",
                 f"training_centered_rms={gaussians.motion_feature_centered_rms:.6f}",
@@ -210,7 +228,7 @@ def render_sequence(args):
                 )
             conditioned_feature_diff = 0.0
             conditioned_norm = 0.0
-            if gaussians.motion_condition_mode == "cross_attention_v4":
+            if gaussians.motion_condition_mode in ("cross_attention_v4", "cross_attention_v5"):
                 actual_conditioned_feature = getattr(
                     gaussians,
                     "_last_condition_motion_feature",
@@ -218,7 +236,7 @@ def render_sequence(args):
                 )
                 if actual_conditioned_feature is None:
                     raise RuntimeError(
-                        "cross_attention_v4 did not record its conditioned motion feature."
+                        f"{gaussians.motion_condition_mode} did not record its conditioned motion feature."
                     )
                 expected_conditioned_feature = gaussians._condition_motion_feature(
                     expected_feature
@@ -248,6 +266,28 @@ def render_sequence(args):
                 f"conditioned_norm={conditioned_norm:.6f}",
                 f"conditioned_max_abs_diff={conditioned_feature_diff:.1e}",
             )
+            if gaussians.motion_condition_mode == "cross_attention_v5":
+                monitor = gaussians.collect_condition_monitor_stats(
+                    include_sensitivity=False
+                )
+                attention_audit = {
+                    key: value
+                    for key, value in monitor.items()
+                    if "/pre_output_cross_attention_" in key
+                    and key.endswith(
+                        (
+                            "gate",
+                            "active_condition_fraction",
+                            "active_attention_entropy_ratio",
+                            "active_token_balance_loss",
+                        )
+                    )
+                }
+                print(
+                    "Rendered cross_attention_v5 skip-fusion audit:",
+                    f"timestep={int(view.timestep)}",
+                    f"stats={attention_audit}",
+                )
         
         rendering = render_out["render"]
 

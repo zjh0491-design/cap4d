@@ -370,6 +370,8 @@ class CrossAttentionCondition2d(nn.Module):
         self.logit_scale_log = nn.Parameter(torch.log(torch.tensor(float(logit_scale_init))))
         self.key_token_bias = nn.Parameter(torch.empty(self.num_tokens, self.hidden_dim))
         self.last_stats = {}
+        self.last_active_entropy_ratio = None
+        self.last_token_balance_loss = None
         self.reset_to_identity()
 
     def reset_to_identity(self):
@@ -430,6 +432,24 @@ class CrossAttentionCondition2d(nn.Module):
             device=x.device,
             dtype=x.dtype,
         )
+        active_samples = condition_mask[:, 0].bool()
+        if bool(active_samples.any()):
+            active_attn = attn[active_samples]
+            active_entropy = -(
+                active_attn * (active_attn + 1e-8).log()
+            ).sum(dim=-1)
+            max_entropy = torch.log(
+                torch.tensor(float(self.num_tokens), device=x.device, dtype=x.dtype)
+            )
+            self.last_active_entropy_ratio = active_entropy.mean() / max_entropy
+            token_usage = active_attn.mean(dim=(0, 1, 2))
+            self.last_token_balance_loss = (
+                token_usage * float(self.num_tokens) - 1.0
+            ).square().mean()
+        else:
+            graph_zero = attn.sum() * 0.0
+            self.last_active_entropy_ratio = graph_zero
+            self.last_token_balance_loss = graph_zero
         gate = torch.sigmoid(self.gate_logit).to(device=x.device, dtype=x.dtype)
         y = x + gate * delta * condition_mask[:, :, None, None]
 
@@ -454,6 +474,13 @@ class CrossAttentionCondition2d(nn.Module):
                 "attention_entropy_mean": float(entropy.mean().cpu()),
                 "attention_entropy_std": float(entropy.std(unbiased=False).cpu()),
                 "attention_max_mean": float(attn.detach().max(dim=-1)[0].mean().cpu()),
+                "active_condition_fraction": float(condition_mask.detach().mean().cpu()),
+                "active_attention_entropy_ratio": float(
+                    self.last_active_entropy_ratio.detach().cpu()
+                ),
+                "active_token_balance_loss": float(
+                    self.last_token_balance_loss.detach().cpu()
+                ),
                 "feature_delta_mean_abs": float((gate * delta).detach().abs().mean().cpu()),
                 "feature_delta_max_abs": float((gate * delta).detach().abs().max().cpu()),
             }
@@ -848,6 +875,7 @@ def define_G(
         "cross_attention_v2",
         "cross_attention_v3",
         "cross_attention_v4",
+        "cross_attention_v5",
     )
     generator_cls = ConditionalUnetGenerator if use_conditional_unet else UnetGenerator
 
@@ -972,14 +1000,19 @@ class ConditionalUnetGenerator(nn.Module):
         use_cross_attention_v2 = condition_mode == "cross_attention_v2"
         use_cross_attention_v3 = condition_mode == "cross_attention_v3"
         use_cross_attention_v4 = condition_mode == "cross_attention_v4"
+        use_cross_attention_v5 = condition_mode == "cross_attention_v5"
         use_feature_cross_attention = (
-            use_cross_attention_v2 or use_cross_attention_v3 or use_cross_attention_v4
+            use_cross_attention_v2
+            or use_cross_attention_v3
+            or use_cross_attention_v4
+            or use_cross_attention_v5
         )
         use_cross_attention = condition_mode in (
             "cross_attention",
             "cross_attention_v2",
             "cross_attention_v3",
             "cross_attention_v4",
+            "cross_attention_v5",
         )
         if use_cross_attention:
             condition_layers = "cross_attention"
@@ -1161,6 +1194,7 @@ class ConditionalUnetGenerator(nn.Module):
             allnorm_condition=use_strict_adain_allnorm,
             condition_trunk=condition_trunk,
             cross_attention_condition=use_cross_attention_v2,
+            cross_attention_pre_output=use_cross_attention_v5,
             cross_attention_decoder_feature=use_cross_attention_v2,
             cross_attention_direct_tokens=condition_attention_direct_tokens,
             cross_attention_use_position=condition_attention_use_position,
@@ -1267,12 +1301,72 @@ class ConditionalUnetGenerator(nn.Module):
                 )
         return rows
 
+    def get_cross_attention_decoder_tail_table(self):
+        """Return the small decoder tail that turns conditioned features into UV offsets."""
+        blocks = (
+            ("scale_2x_up", self.model.submodule.submodule.up),
+            ("scale_1x_up", self.model.submodule.up),
+            ("deformation_output", self.model.up),
+        )
+        rows = []
+        for name, module in blocks:
+            rows.append(
+                {
+                    "name": name,
+                    "module": module,
+                    "parameters": sum(param.numel() for param in module.parameters()),
+                }
+            )
+        return rows
+
+    def get_cross_attention_full_decoder_table(self):
+        """Return every recursive decoder up block without including the encoder."""
+        rows = []
+        seen_modules = set()
+        for module in self.modules():
+            if not isinstance(module, ConditionalUnetSkipConnectionBlock):
+                continue
+            up = module.up
+            if id(up) in seen_modules:
+                continue
+            seen_modules.add(id(up))
+            rows.append(
+                {
+                    "name": f"{module.block_name}_up",
+                    "module": up,
+                    "parameters": sum(param.numel() for param in up.parameters()),
+                }
+            )
+        return rows
+
     def get_cross_attention_stats(self):
         stats = {}
         for name, module in self.named_modules():
             if isinstance(module, CrossAttentionCondition2d):
                 stats[name] = dict(module.last_stats)
         return stats
+
+    def get_cross_attention_regularization(self, entropy_target_ratio=0.72):
+        """Return active-condition selectivity and global token-usage penalties."""
+        entropy_target_ratio = float(entropy_target_ratio)
+        selectivity_terms = []
+        balance_terms = []
+        for module in self.modules():
+            if not isinstance(module, CrossAttentionCondition2d):
+                continue
+            entropy_ratio = module.last_active_entropy_ratio
+            balance_loss = module.last_token_balance_loss
+            if entropy_ratio is None or balance_loss is None:
+                continue
+            selectivity_terms.append(
+                F.relu(entropy_ratio - entropy_target_ratio).square()
+            )
+            balance_terms.append(balance_loss)
+        if not selectivity_terms:
+            parameter = next(self.parameters())
+            zero = parameter.sum() * 0.0
+            return zero, zero
+        return torch.stack(selectivity_terms).mean(), torch.stack(balance_terms).mean()
 
     def get_cross_attention_grad_stats(self):
         stats = {}
@@ -1338,6 +1432,7 @@ class ConditionalUnetSkipConnectionBlock(nn.Module):
         allnorm_condition=False,
         condition_trunk=None,
         cross_attention_condition=False,
+        cross_attention_pre_output=False,
         cross_attention_decoder_feature=False,
         cross_attention_direct_tokens=False,
         cross_attention_use_position=False,
@@ -1356,6 +1451,7 @@ class ConditionalUnetSkipConnectionBlock(nn.Module):
         self.condition_residual_branch = None
         self.spatial_residual_branch_v2 = None
         self.cross_attention_condition = None
+        self.pre_output_cross_attention_condition = None
         self.cross_attention_decoder_feature = bool(cross_attention_decoder_feature)
         self.last_condition_residual = None
         self.last_base_output = None
@@ -1416,6 +1512,20 @@ class ConditionalUnetSkipConnectionBlock(nn.Module):
                     condition_attention_output_init_std,
                     condition_attention_logit_scale,
                     f"{self.block_name}.output_cross_attention_c{outer_nc}",
+                    direct_token_projection=cross_attention_direct_tokens,
+                    use_spatial_position=cross_attention_use_position,
+                )
+            if cross_attention_pre_output:
+                self.pre_output_cross_attention_condition = self._make_cross_attention_module(
+                    inner_nc * 2,
+                    condition_dim,
+                    condition_hidden_dim,
+                    condition_attention_dim,
+                    condition_num_tokens,
+                    condition_cross_attention_gate_init,
+                    condition_attention_output_init_std,
+                    condition_attention_logit_scale,
+                    f"{self.block_name}.pre_output_cross_attention_c{inner_nc * 2}",
                     direct_token_projection=cross_attention_direct_tokens,
                     use_spatial_position=cross_attention_use_position,
                 )
@@ -1623,6 +1733,8 @@ class ConditionalUnetSkipConnectionBlock(nn.Module):
 
         if self.submodule is not None:
             down = self.submodule(down, condition, feature_collector=feature_collector)
+        if self.outermost and self.pre_output_cross_attention_condition is not None:
+            down = self.pre_output_cross_attention_condition(down, condition)
         up = self._forward_up(down, condition)
         if self.dropout is not None:
             up = self.dropout(up)

@@ -5,6 +5,7 @@
 # related documentation without an express license agreement from Toyota Motor Europe NV/SA 
 # is strictly prohibited.
 #
+import copy
 from pathlib import Path
 from typing import Dict
 
@@ -33,6 +34,20 @@ FLAME_TEMPLATE_PATH = "data/assets/flame/cap4d_avatar_template.obj"
 BACK_HEAD_FACE_IDS_PATH = "data/assets/flame/back_head_region/back_head_face_ids.npy"
 BACK_HEAD_UV_TRANSITION_PATH = "data/assets/flame/back_head_region/back_head_uv_transition.png"
 STD_DEFORM = 0.0108
+CROSS_ATTENTION_MODES = (
+    "cross_attention",
+    "cross_attention_v2",
+    "cross_attention_v3",
+    "cross_attention_v4",
+    "cross_attention_v5",
+)
+FEATURE_CROSS_ATTENTION_MODES = (
+    "cross_attention_v2",
+    "cross_attention_v3",
+    "cross_attention_v4",
+    "cross_attention_v5",
+)
+CAUSAL_CROSS_ATTENTION_MODES = ("cross_attention_v4", "cross_attention_v5")
 
 
 class CAP4DGaussianModel(GaussianModel):
@@ -93,12 +108,7 @@ class CAP4DGaussianModel(GaussianModel):
             self.motion_condition_layers = "allnorm"
         if self.motion_condition_mode == "spatial_residual_branch_v2":
             self.motion_condition_layers = "spatial_residual_v2"
-        if self.motion_condition_mode in (
-            "cross_attention",
-            "cross_attention_v2",
-            "cross_attention_v3",
-            "cross_attention_v4",
-        ):
+        if self.motion_condition_mode in CROSS_ATTENTION_MODES:
             self.motion_condition_layers = "cross_attention"
         self.motion_condition_hidden_dim = int(model_params.get("motion_condition_hidden_dim", 128))
         self.motion_condition_gamma_scale = float(model_params.get("motion_condition_gamma_scale", 0.1))
@@ -143,6 +153,42 @@ class CAP4DGaussianModel(GaussianModel):
         self.motion_cross_attention_adapter_only = bool(
             model_params.get("motion_cross_attention_adapter_only", False)
         )
+        self.motion_cross_attention_selective_unfreeze = bool(
+            model_params.get("motion_cross_attention_selective_unfreeze", False)
+        )
+        self.motion_cross_attention_detail_unfreeze = bool(
+            model_params.get("motion_cross_attention_detail_unfreeze", False)
+        )
+        self.motion_cross_attention_decoder_lr_mult = float(
+            model_params.get("motion_cross_attention_decoder_lr_mult", 0.1)
+        )
+        self.motion_cross_attention_decoder_start_iter = int(
+            model_params.get("motion_cross_attention_decoder_start_iter", 0)
+        )
+        self.motion_cross_attention_decoder_warmup_iters = int(
+            model_params.get("motion_cross_attention_decoder_warmup_iters", 0)
+        )
+        self.motion_cross_attention_gaussian_start_iter = int(
+            model_params.get("motion_cross_attention_gaussian_start_iter", 0)
+        )
+        self.motion_cross_attention_gaussian_warmup_iters = int(
+            model_params.get("motion_cross_attention_gaussian_warmup_iters", 0)
+        )
+        self.motion_cross_attention_gaussian_xyz_lr_mult = float(
+            model_params.get("motion_cross_attention_gaussian_xyz_lr_mult", 0.0)
+        )
+        self.motion_cross_attention_gaussian_feature_lr_mult = float(
+            model_params.get("motion_cross_attention_gaussian_feature_lr_mult", 0.0)
+        )
+        self.motion_cross_attention_gaussian_opacity_lr_mult = float(
+            model_params.get("motion_cross_attention_gaussian_opacity_lr_mult", 0.0)
+        )
+        self.motion_cross_attention_gaussian_scaling_lr_mult = float(
+            model_params.get("motion_cross_attention_gaussian_scaling_lr_mult", 0.0)
+        )
+        self.motion_cross_attention_gaussian_rotation_lr_mult = float(
+            model_params.get("motion_cross_attention_gaussian_rotation_lr_mult", 0.0)
+        )
         self.motion_cross_attention_centering = str(
             model_params.get("motion_cross_attention_centering", "training_mean")
         ).lower()
@@ -170,6 +216,27 @@ class CAP4DGaussianModel(GaussianModel):
             raise ValueError("motion_cross_attention_base_lr_mult_after_pretrain must be non-negative.")
         if self.motion_cross_attention_condition_warmup_iters < 0:
             raise ValueError("motion_cross_attention_condition_warmup_iters must be non-negative.")
+        if self.motion_cross_attention_decoder_lr_mult < 0.0:
+            raise ValueError("motion_cross_attention_decoder_lr_mult must be non-negative.")
+        if self.motion_cross_attention_decoder_start_iter < 0:
+            raise ValueError("motion_cross_attention_decoder_start_iter must be non-negative.")
+        if self.motion_cross_attention_decoder_warmup_iters < 0:
+            raise ValueError("motion_cross_attention_decoder_warmup_iters must be non-negative.")
+        if self.motion_cross_attention_gaussian_start_iter < 0:
+            raise ValueError("motion_cross_attention_gaussian_start_iter must be non-negative.")
+        if self.motion_cross_attention_gaussian_warmup_iters < 0:
+            raise ValueError("motion_cross_attention_gaussian_warmup_iters must be non-negative.")
+        for name, value in (
+            ("xyz", self.motion_cross_attention_gaussian_xyz_lr_mult),
+            ("feature", self.motion_cross_attention_gaussian_feature_lr_mult),
+            ("opacity", self.motion_cross_attention_gaussian_opacity_lr_mult),
+            ("scaling", self.motion_cross_attention_gaussian_scaling_lr_mult),
+            ("rotation", self.motion_cross_attention_gaussian_rotation_lr_mult),
+        ):
+            if value < 0.0:
+                raise ValueError(
+                    f"motion_cross_attention_gaussian_{name}_lr_mult must be non-negative."
+                )
         if self.motion_cross_attention_centering not in ("none", "training_mean"):
             raise ValueError(
                 "motion_cross_attention_centering must be 'none' or 'training_mean'."
@@ -188,22 +255,45 @@ class CAP4DGaussianModel(GaussianModel):
             )
         if (
             self.motion_cross_attention_adapter_only
-            and self.motion_condition_mode not in (
-                "cross_attention_v2",
-                "cross_attention_v3",
-                "cross_attention_v4",
-            )
+            and self.motion_condition_mode not in FEATURE_CROSS_ATTENTION_MODES
         ):
             raise ValueError(
                 "motion_cross_attention_adapter_only requires cross_attention_v2, "
-                "cross_attention_v3, or cross_attention_v4."
+                "cross_attention_v3, cross_attention_v4, or cross_attention_v5."
+            )
+        optimization_profiles = sum(
+            int(enabled)
+            for enabled in (
+                self.motion_cross_attention_adapter_only,
+                self.motion_cross_attention_selective_unfreeze,
+                self.motion_cross_attention_detail_unfreeze,
+            )
+        )
+        if optimization_profiles > 1:
+            raise ValueError(
+                "motion_cross_attention_adapter_only, selective_unfreeze, and "
+                "detail_unfreeze are mutually exclusive."
+            )
+        if (
+            self.motion_cross_attention_selective_unfreeze
+            and self.motion_condition_mode not in CAUSAL_CROSS_ATTENTION_MODES
+        ):
+            raise ValueError(
+                "motion_cross_attention_selective_unfreeze requires cross_attention_v4/v5."
+            )
+        if (
+            self.motion_cross_attention_detail_unfreeze
+            and self.motion_condition_mode not in CAUSAL_CROSS_ATTENTION_MODES
+        ):
+            raise ValueError(
+                "motion_cross_attention_detail_unfreeze requires cross_attention_v4/v5."
             )
         if (
             self.motion_cross_attention_mismatch_enabled
-            and self.motion_condition_mode != "cross_attention_v4"
+            and self.motion_condition_mode not in CAUSAL_CROSS_ATTENTION_MODES
         ):
             raise ValueError(
-                "motion_cross_attention_mismatch_enabled requires cross_attention_v4."
+                "motion_cross_attention_mismatch_enabled requires cross_attention_v4/v5."
             )
         self.motion_condition_runtime_shuffle = str(
             model_params.get("motion_condition_runtime_shuffle", "none")
@@ -223,6 +313,7 @@ class CAP4DGaussianModel(GaussianModel):
             )
         self.motion_neutral_index = None
         self._motion_feature_override = None
+        self._motion_auxiliary_pass = False
         self._is_training_mode = False
         self.current_flame_verts_for_region_masks = None
         self.use_legacy_motion_concat = self.use_motion_condition and self.motion_condition_mode == "legacy_concat"
@@ -238,6 +329,7 @@ class CAP4DGaussianModel(GaussianModel):
             "cross_attention_v2",
             "cross_attention_v3",
             "cross_attention_v4",
+            "cross_attention_v5",
         )
         if self.use_motion_condition and not (self.use_legacy_motion_concat or self.use_conditional_norm):
             raise ValueError(
@@ -245,7 +337,7 @@ class CAP4DGaussianModel(GaussianModel):
                 "Use 'legacy_concat', 'strict_adain', 'strict_adain_allnorm', "
                 "'film', 'gated_multistage', 'residual_branch', or "
                 "'spatial_residual_branch_v2', 'cross_attention', 'cross_attention_v2', "
-                "'cross_attention_v3', or 'cross_attention_v4'."
+                "'cross_attention_v3', 'cross_attention_v4', or 'cross_attention_v5'."
             )
         self.motion_features = None
         self.motion_training_count = None
@@ -268,6 +360,16 @@ class CAP4DGaussianModel(GaussianModel):
         self.cross_attention_v4_deform_output = None
         self.cross_attention_v4_nodeform_output = None
         self.cross_attention_v4_mismatch_deform_output = None
+        self.motion_zero_current_actual_full = None
+        self.motion_zero_teacher_actual_full = None
+        self.motion_zero_current_deform_output = None
+        self.motion_zero_teacher_deform_output = None
+        self.motion_zero_teacher = None
+        self.motion_zero_teacher_source = "none"
+        self.motion_cross_attention_decoder_tail_params = 0
+        self.motion_cross_attention_decoder_scope = "none"
+        self.motion_cross_attention_gaussian_trainable_params = 0
+        self._motion_detail_gaussian_base_lrs = {}
         self._last_motion_mismatch_index = None
         self._last_motion_mismatch_flame_distance = 0.0
         self._last_motion_mismatch_condition_cosine = 0.0
@@ -278,6 +380,8 @@ class CAP4DGaussianModel(GaussianModel):
         self._cross_attention_base_pretrain_active = False
         self._cross_attention_condition_lr_scale = 1.0
         self._cross_attention_base_lr_scale = 1.0
+        self._cross_attention_decoder_lr_scale = 1.0
+        self._cross_attention_gaussian_lr_scale = 0.0
         self.enable_back_static_mask = model_params.get("enable_back_static_mask", False)
         self.back_static_mask_path = model_params.get("back_static_mask_path", BACK_HEAD_UV_TRANSITION_PATH)
         self.back_static_mode = model_params.get("back_static_mode", "neutral")
@@ -332,6 +436,18 @@ class CAP4DGaussianModel(GaussianModel):
                     f"cross_attention_base_lr_mult_after_pretrain={self.motion_cross_attention_base_lr_mult_after_pretrain}",
                     f"cross_attention_condition_warmup_iters={self.motion_cross_attention_condition_warmup_iters}",
                     f"cross_attention_adapter_only={self.motion_cross_attention_adapter_only}",
+                    f"cross_attention_selective_unfreeze={self.motion_cross_attention_selective_unfreeze}",
+                    f"cross_attention_detail_unfreeze={self.motion_cross_attention_detail_unfreeze}",
+                    f"cross_attention_decoder_lr_mult={self.motion_cross_attention_decoder_lr_mult}",
+                    f"cross_attention_decoder_start_iter={self.motion_cross_attention_decoder_start_iter}",
+                    f"cross_attention_decoder_warmup_iters={self.motion_cross_attention_decoder_warmup_iters}",
+                    f"cross_attention_gaussian_start_iter={self.motion_cross_attention_gaussian_start_iter}",
+                    f"cross_attention_gaussian_warmup_iters={self.motion_cross_attention_gaussian_warmup_iters}",
+                    f"cross_attention_gaussian_xyz_lr_mult={self.motion_cross_attention_gaussian_xyz_lr_mult}",
+                    f"cross_attention_gaussian_feature_lr_mult={self.motion_cross_attention_gaussian_feature_lr_mult}",
+                    f"cross_attention_gaussian_opacity_lr_mult={self.motion_cross_attention_gaussian_opacity_lr_mult}",
+                    f"cross_attention_gaussian_scaling_lr_mult={self.motion_cross_attention_gaussian_scaling_lr_mult}",
+                    f"cross_attention_gaussian_rotation_lr_mult={self.motion_cross_attention_gaussian_rotation_lr_mult}",
                     f"cross_attention_centering={self.motion_cross_attention_centering}",
                     f"cross_attention_mismatch_enabled={self.motion_cross_attention_mismatch_enabled}",
                     f"cross_attention_mismatch_candidates={self.motion_cross_attention_mismatch_candidates}",
@@ -361,23 +477,14 @@ class CAP4DGaussianModel(GaussianModel):
             condition_cross_attention_gate_init=self.motion_cross_attention_gate_init,
             condition_attention_output_init_std=self.motion_cross_attention_output_init_std,
             condition_attention_logit_scale=self.motion_cross_attention_logit_scale,
-            condition_attention_direct_tokens=self.motion_condition_mode in (
-                "cross_attention_v2",
-                "cross_attention_v3",
-                "cross_attention_v4",
+            condition_attention_direct_tokens=(
+                self.motion_condition_mode in FEATURE_CROSS_ATTENTION_MODES
             ),
-            condition_attention_use_position=self.motion_condition_mode in (
-                "cross_attention_v2",
-                "cross_attention_v3",
-                "cross_attention_v4",
+            condition_attention_use_position=(
+                self.motion_condition_mode in FEATURE_CROSS_ATTENTION_MODES
             ),
         ).cuda()
-        if self.motion_condition_mode in (
-            "cross_attention",
-            "cross_attention_v2",
-            "cross_attention_v3",
-            "cross_attention_v4",
-        ):
+        if self.motion_condition_mode in CROSS_ATTENTION_MODES:
             cross_attention_sites = self.deform_net.get_cross_attention_site_table()
             cross_attention_params = sum(row["parameters"] for row in cross_attention_sites)
             print(
@@ -392,6 +499,17 @@ class CAP4DGaussianModel(GaussianModel):
                     raise RuntimeError(
                         f"{self.motion_condition_mode} must inject only at "
                         "c256/c128/c64 decoder features."
+                    )
+            if self.motion_condition_mode == "cross_attention_v5":
+                sites = [row["site"] for row in cross_attention_sites]
+                if (
+                    len(sites) != 4
+                    or not any("pre_output_cross_attention_c128" in site for site in sites)
+                    or any(site.endswith(".output_cross_attention_c3") for site in sites)
+                ):
+                    raise RuntimeError(
+                        "cross_attention_v5 must use c256/c128/c64 decoder attention "
+                        "plus c128 pre-output skip-fusion attention, without c3 output attention."
                     )
         with torch.no_grad():
             # Initialize final deformation layer with zeros so that initial deformation is zero
@@ -686,7 +804,7 @@ class CAP4DGaussianModel(GaussianModel):
             else:
                 self.motion_features = self._align_motion_features(self.motion_features, T).cuda()
                 if (
-                    self.motion_condition_mode == "cross_attention_v4"
+                    self.motion_condition_mode in CAUSAL_CROSS_ATTENTION_MODES
                     and not self._motion_feature_center_restored
                 ):
                     self._set_motion_feature_center(
@@ -757,7 +875,7 @@ class CAP4DGaussianModel(GaussianModel):
         motion_features = self._load_motion_feature_object(motion_feature_path)
         self.motion_features = self._as_motion_feature_matrix(motion_features)
         if (
-            self.motion_condition_mode == "cross_attention_v4"
+            self.motion_condition_mode in CAUSAL_CROSS_ATTENTION_MODES
             and not self._motion_feature_center_restored
         ):
             self._set_motion_feature_center(
@@ -797,7 +915,7 @@ class CAP4DGaussianModel(GaussianModel):
 
     def _condition_motion_feature(self, motion_feature):
         if (
-            self.motion_condition_mode != "cross_attention_v4"
+            self.motion_condition_mode not in CAUSAL_CROSS_ATTENTION_MODES
             or self.motion_cross_attention_centering == "none"
         ):
             return motion_feature
@@ -849,6 +967,7 @@ class CAP4DGaussianModel(GaussianModel):
                 "cross_attention_v2",
                 "cross_attention_v3",
                 "cross_attention_v4",
+                "cross_attention_v5",
             )
             and self._cross_attention_base_pretrain_active
         ):
@@ -1070,12 +1189,16 @@ class CAP4DGaussianModel(GaussianModel):
     def eval(self):
         self._is_training_mode = False
         self.deform_net.eval()
+        if self.motion_zero_teacher is not None:
+            self.motion_zero_teacher.eval()
         if self.motion_condition_proj is not None:
             self.motion_condition_proj.eval()
 
     def train(self):
         self._is_training_mode = True
         self.deform_net.train()
+        if self.motion_zero_teacher is not None:
+            self.motion_zero_teacher.eval()
         if self.motion_condition_proj is not None:
             self.motion_condition_proj.train()
 
@@ -1084,6 +1207,28 @@ class CAP4DGaussianModel(GaussianModel):
 
     def clear_motion_feature_override(self):
         self._motion_feature_override = None
+
+    def set_motion_auxiliary_pass(self, enabled):
+        """Disable nested causal-attention diagnostics during counterfactual renders."""
+        self._motion_auxiliary_pass = bool(enabled)
+
+    def sample_mismatched_motion_feature_for_timestep(self, timestep, device, dtype):
+        if (
+            self.motion_features is None
+            or self.motion_condition_mode not in CAUSAL_CROSS_ATTENTION_MODES
+        ):
+            return None
+        previous_timestep = self.timestep
+        self.timestep = int(timestep)
+        try:
+            current_raw = self._current_motion_feature(1, device, dtype)
+            return self._sample_mismatched_motion_feature(
+                current_raw,
+                device,
+                dtype,
+            ).detach()
+        finally:
+            self.timestep = previous_timestep
 
     def select_mesh_by_timestep(self, timestep):
         self.timestep = timestep
@@ -1147,18 +1292,9 @@ class CAP4DGaussianModel(GaussianModel):
         self._last_cross_attention_uv_noise_std = 0.0
         if (
             not self._is_training_mode
-            or self.motion_condition_mode not in (
-                "cross_attention",
-                "cross_attention_v2",
-                "cross_attention_v3",
-                "cross_attention_v4",
-            )
+            or self.motion_condition_mode not in CROSS_ATTENTION_MODES
             or (
-                self.motion_condition_mode in (
-                    "cross_attention_v2",
-                    "cross_attention_v3",
-                    "cross_attention_v4",
-                )
+                self.motion_condition_mode in FEATURE_CROSS_ATTENTION_MODES
                 and self._cross_attention_base_pretrain_active
             )
         ):
@@ -1226,6 +1362,10 @@ class CAP4DGaussianModel(GaussianModel):
         self.cross_attention_v4_deform_output = None
         self.cross_attention_v4_nodeform_output = None
         self.cross_attention_v4_mismatch_deform_output = None
+        self.motion_zero_current_actual_full = None
+        self.motion_zero_teacher_actual_full = None
+        self.motion_zero_current_deform_output = None
+        self.motion_zero_teacher_deform_output = None
         self.deform_base_output = None
         self.neutral_base_output = None
         cross_attention_base_output_norm = None
@@ -1244,7 +1384,7 @@ class CAP4DGaussianModel(GaussianModel):
                 uv_offsets.dtype,
                 motion_feature,
             )
-            if self.motion_condition_mode == "cross_attention_v4":
+            if self.motion_condition_mode in CAUSAL_CROSS_ATTENTION_MODES:
                 nodeform_feature = self._condition_motion_feature(nodeform_feature)
             condition_input = torch.cat(
                 [motion_feature, nodeform_feature],
@@ -1255,18 +1395,47 @@ class CAP4DGaussianModel(GaussianModel):
                     f"Condition batch {condition_input.shape[0]} must match U-Net batch {unet_input.shape[0]}"
                 )
             if (
-                self.motion_condition_mode in ("cross_attention_v3", "cross_attention_v4")
+                self.motion_condition_mode
+                in ("cross_attention_v3",) + CAUSAL_CROSS_ATTENTION_MODES
                 and self._is_training_mode
+                and not self._motion_auxiliary_pass
             ):
                 # Compare against the frozen zero-condition path using the exact same UV input.
                 # Running this first leaves per-site attention statistics from the conditioned pass.
-                with torch.no_grad():
+                if (
+                    self.motion_cross_attention_selective_unfreeze
+                    or self.motion_cross_attention_detail_unfreeze
+                ):
                     cross_attention_base_output_norm = self.deform_net(
                         unet_input,
                         condition=torch.zeros_like(condition_input),
                     )
+                else:
+                    with torch.no_grad():
+                        cross_attention_base_output_norm = self.deform_net(
+                            unet_input,
+                            condition=torch.zeros_like(condition_input),
+                        )
                 if (
-                    self.motion_condition_mode == "cross_attention_v4"
+                    (
+                        self.motion_cross_attention_selective_unfreeze
+                        or self.motion_cross_attention_detail_unfreeze
+                    )
+                    and self.motion_zero_teacher is not None
+                ):
+                    with torch.no_grad():
+                        motion_zero_teacher_output_norm = self.motion_zero_teacher(
+                            unet_input,
+                            condition=torch.zeros_like(condition_input),
+                        )
+                    self.motion_zero_current_actual_full = (
+                        cross_attention_base_output_norm * STD_DEFORM
+                    )
+                    self.motion_zero_teacher_actual_full = (
+                        motion_zero_teacher_output_norm * STD_DEFORM
+                    )
+                if (
+                    self.motion_condition_mode in CAUSAL_CROSS_ATTENTION_MODES
                     and self.motion_cross_attention_mismatch_enabled
                     and not self._cross_attention_base_pretrain_active
                 ):
@@ -1305,9 +1474,10 @@ class CAP4DGaussianModel(GaussianModel):
                 self.spatial_residual_v2_base_actual_full = base_output_norm * STD_DEFORM
                 self.spatial_residual_v2_delta_actual_full = condition_residual_norm * STD_DEFORM
             if cross_attention_base_output_norm is not None:
-                base_actual_full = cross_attention_base_output_norm * STD_DEFORM
+                detached_base_output_norm = cross_attention_base_output_norm.detach()
+                base_actual_full = detached_base_output_norm * STD_DEFORM
                 delta_actual_full = (
-                    unet_output_norm - cross_attention_base_output_norm
+                    unet_output_norm - detached_base_output_norm
                 ) * STD_DEFORM
                 if self.motion_condition_mode == "cross_attention_v3":
                     self.cross_attention_v3_base_actual_full = base_actual_full
@@ -1318,7 +1488,7 @@ class CAP4DGaussianModel(GaussianModel):
                     if cross_attention_v4_mismatch_output_norm is not None:
                         self.cross_attention_v4_mismatch_delta_actual_full = (
                             cross_attention_v4_mismatch_output_norm
-                            - cross_attention_base_output_norm
+                            - detached_base_output_norm
                         ) * STD_DEFORM
             unet_output = unet_output_norm * STD_DEFORM
         else:
@@ -1349,6 +1519,13 @@ class CAP4DGaussianModel(GaussianModel):
                     v4_mismatch_delta_deform_output,
                     v4_mismatch_delta_nodeform_output,
                 ) = self.cross_attention_v4_mismatch_delta_actual_full.chunk(2, dim=0)
+        if self.motion_zero_current_actual_full is not None:
+            zero_current_deform, zero_current_nodeform = (
+                self.motion_zero_current_actual_full.chunk(2, dim=0)
+            )
+            zero_teacher_deform, zero_teacher_nodeform = (
+                self.motion_zero_teacher_actual_full.chunk(2, dim=0)
+            )
 
         # set deform mask places to neutral output so that it cannot deform
         deform_output = self.deform_mask * deform_output + torch.logical_not(self.deform_mask) * nodeform_output
@@ -1393,6 +1570,23 @@ class CAP4DGaussianModel(GaussianModel):
                 self.cross_attention_v4_mismatch_deform_output = (
                     v4_mismatch_output_masked - v4_base_deform_masked
                 )
+        if self.motion_zero_current_actual_full is not None:
+            self.motion_zero_current_deform_output = (
+                self.deform_mask * zero_current_deform
+                + torch.logical_not(self.deform_mask) * zero_current_nodeform
+            )
+            self.motion_zero_current_deform_output = self._apply_back_static_mask(
+                self.motion_zero_current_deform_output,
+                zero_current_nodeform,
+            )
+            self.motion_zero_teacher_deform_output = (
+                self.deform_mask * zero_teacher_deform
+                + torch.logical_not(self.deform_mask) * zero_teacher_nodeform
+            )
+            self.motion_zero_teacher_deform_output = self._apply_back_static_mask(
+                self.motion_zero_teacher_deform_output,
+                zero_teacher_nodeform,
+            )
         if save_debug:
             self._maybe_save_deform_debug(deform_output, nodeform_output)
 
@@ -1466,6 +1660,7 @@ class CAP4DGaussianModel(GaussianModel):
             return {}
 
         stats = {}
+        causal_prefix = f"condition/{self.motion_condition_mode}"
         deform_net = self.deform_net.module if hasattr(self.deform_net, "module") else self.deform_net
         if hasattr(deform_net, "get_adain_site_table"):
             site_table = deform_net.get_adain_site_table()
@@ -1491,37 +1686,94 @@ class CAP4DGaussianModel(GaussianModel):
             stats["condition/cross_attention/condition_lr_scale"] = float(
                 self._cross_attention_condition_lr_scale
             )
+            stats["condition/cross_attention/decoder_lr_scale"] = float(
+                self._cross_attention_decoder_lr_scale
+            )
             stats["condition/cross_attention/adapter_only"] = float(
                 self.motion_cross_attention_adapter_only
             )
-            if self.motion_condition_mode == "cross_attention_v4":
-                stats["condition/cross_attention_v4/feature_common_energy_ratio"] = float(
+            stats["condition/cross_attention/selective_unfreeze"] = float(
+                self.motion_cross_attention_selective_unfreeze
+            )
+            stats["condition/cross_attention/detail_unfreeze"] = float(
+                self.motion_cross_attention_detail_unfreeze
+            )
+            stats["condition/cross_attention/decoder_tail_param_count"] = float(
+                self.motion_cross_attention_decoder_tail_params
+            )
+            stats["condition/cross_attention/decoder_param_count"] = float(
+                self.motion_cross_attention_decoder_tail_params
+            )
+            stats["condition/cross_attention/decoder_scope_full"] = float(
+                self.motion_cross_attention_decoder_scope == "full"
+            )
+            stats["condition/cross_attention/gaussian_lr_scale"] = float(
+                self._cross_attention_gaussian_lr_scale
+            )
+            stats["condition/cross_attention/gaussian_trainable_param_count"] = float(
+                self.motion_cross_attention_gaussian_trainable_params
+            )
+            stats["condition/cross_attention/detail_total_param_count"] = float(
+                stats["condition/cross_attention/param_count"]
+                + self.motion_cross_attention_decoder_tail_params
+                + self.motion_cross_attention_gaussian_trainable_params
+            )
+            if hasattr(self, "optimizer") and self.optimizer is not None:
+                monitored_lrs = {
+                    "deform_net_cross_attention": "attention_lr",
+                    "deform_net_decoder_tail": "decoder_lr",
+                    "deform_net_decoder_full": "decoder_lr",
+                    "xyz": "gaussian_xyz_lr",
+                    "f_dc": "gaussian_f_dc_lr",
+                    "f_rest": "gaussian_f_rest_lr",
+                    "opacity": "gaussian_opacity_lr",
+                    "scaling": "gaussian_scaling_lr",
+                    "rotation": "gaussian_rotation_lr",
+                }
+                for group in self.optimizer.param_groups:
+                    stat_name = monitored_lrs.get(group["name"])
+                    if stat_name is not None:
+                        stats[f"condition/cross_attention/{stat_name}"] = float(group["lr"])
+                        grad_norm_sq = 0.0
+                        for param in group["params"]:
+                            if param.grad is None:
+                                continue
+                            param_grad_norm = float(
+                                param.grad.detach().float().norm().cpu()
+                            )
+                            grad_norm_sq += param_grad_norm * param_grad_norm
+                        grad_stat_name = stat_name.removesuffix("_lr") + "_grad_norm"
+                        stats[f"condition/cross_attention/{grad_stat_name}"] = (
+                            grad_norm_sq ** 0.5
+                        )
+            if self.motion_condition_mode in CAUSAL_CROSS_ATTENTION_MODES:
+                stats[f"{causal_prefix}/feature_common_energy_ratio"] = float(
                     self.motion_feature_common_energy_ratio
                 )
-                stats["condition/cross_attention_v4/feature_centered_rms"] = float(
+                stats[f"{causal_prefix}/feature_centered_rms"] = float(
                     self.motion_feature_centered_rms
                 )
-                stats["condition/cross_attention_v4/mismatch_enabled"] = float(
+                stats[f"{causal_prefix}/mismatch_enabled"] = float(
                     self.motion_cross_attention_mismatch_enabled
                 )
-                stats["condition/cross_attention_v4/mismatch_index"] = float(
+                stats[f"{causal_prefix}/mismatch_index"] = float(
                     self._last_motion_mismatch_index
                     if self._last_motion_mismatch_index is not None else -1
                 )
-                stats["condition/cross_attention_v4/mismatch_flame_distance"] = float(
+                stats[f"{causal_prefix}/mismatch_flame_distance"] = float(
                     self._last_motion_mismatch_flame_distance
                 )
-                stats["condition/cross_attention_v4/mismatch_condition_cosine"] = float(
+                stats[f"{causal_prefix}/mismatch_condition_cosine"] = float(
                     self._last_motion_mismatch_condition_cosine
                 )
                 if hasattr(self, "_last_prepared_motion_feature"):
                     raw_feature = self._last_prepared_motion_feature.detach().float()
-                    stats["condition/cross_attention_v4/current_raw_rms"] = float(
+                    stats[f"{causal_prefix}/current_raw_rms"] = float(
                         raw_feature.square().mean().sqrt().cpu()
                     )
                 if hasattr(self, "_last_condition_motion_feature"):
                     condition_feature = self._last_condition_motion_feature.detach().float()
-                    stats["condition/cross_attention_v4/current_centered_rms"] = float(
+                    stats[f"{causal_prefix}/current_centered_rms"] = float(
                         condition_feature.square().mean().sqrt().cpu()
                     )
         if hasattr(deform_net, "get_condition_stats"):
@@ -1553,6 +1805,9 @@ class CAP4DGaussianModel(GaussianModel):
                     "attention_entropy_mean",
                     "attention_entropy_std",
                     "attention_max_mean",
+                    "active_condition_fraction",
+                    "active_attention_entropy_ratio",
+                    "active_token_balance_loss",
                     "logit_scale",
                     "normalize_qk",
                     "direct_token_projection",
@@ -1635,32 +1890,48 @@ class CAP4DGaussianModel(GaussianModel):
             delta_rms = delta.square().mean().sqrt()
             base_rms = base.square().mean().sqrt()
             mismatch_rms = mismatch_delta.square().mean().sqrt()
-            stats["condition/cross_attention_v4/delta_actual_mean_abs"] = float(
+            stats[f"{causal_prefix}/delta_actual_mean_abs"] = float(
                 delta.abs().mean().cpu()
             )
-            stats["condition/cross_attention_v4/delta_actual_rms"] = float(
+            stats[f"{causal_prefix}/delta_actual_rms"] = float(
                 delta_rms.cpu()
             )
-            stats["condition/cross_attention_v4/delta_actual_max_abs"] = float(
+            stats[f"{causal_prefix}/delta_actual_max_abs"] = float(
                 delta.abs().max().cpu()
             )
-            stats["condition/cross_attention_v4/base_actual_rms"] = float(
+            stats[f"{causal_prefix}/base_actual_rms"] = float(
                 base_rms.cpu()
             )
-            stats["condition/cross_attention_v4/delta_over_base_rms"] = float(
+            stats[f"{causal_prefix}/delta_over_base_rms"] = float(
                 (delta_rms / (base_rms + 1e-8)).cpu()
             )
-            stats["condition/cross_attention_v4/mismatch_delta_actual_rms"] = float(
+            stats[f"{causal_prefix}/mismatch_delta_actual_rms"] = float(
                 mismatch_rms.cpu()
             )
-            stats["condition/cross_attention_v4/mismatch_over_base_rms"] = float(
+            stats[f"{causal_prefix}/mismatch_over_base_rms"] = float(
                 (mismatch_rms / (base_rms + 1e-8)).cpu()
             )
-            stats["condition/cross_attention_v4/aligned_over_mismatch_rms"] = float(
+            stats[f"{causal_prefix}/aligned_over_mismatch_rms"] = float(
                 (delta_rms / (mismatch_rms + 1e-8)).cpu()
             )
-            stats["condition/cross_attention_v4/nodeform_delta_actual_max_abs"] = float(
+            stats[f"{causal_prefix}/nodeform_delta_actual_max_abs"] = float(
                 self.cross_attention_v4_nodeform_output.detach().abs().max().cpu()
+            )
+        if (
+            self.motion_zero_current_deform_output is not None
+            and self.motion_zero_teacher_deform_output is not None
+        ):
+            current = self.motion_zero_current_deform_output.detach()
+            teacher = self.motion_zero_teacher_deform_output.detach()
+            teacher_rms = teacher.square().mean().sqrt()
+            stats[f"{causal_prefix}/zero_teacher_delta_rms"] = float(
+                (current - teacher).square().mean().sqrt().cpu()
+            )
+            stats[f"{causal_prefix}/zero_teacher_relative_rms"] = float(
+                (
+                    (current - teacher).square().mean().sqrt()
+                    / (teacher_rms + 1e-8)
+                ).cpu()
             )
 
         if include_sensitivity:
@@ -1824,7 +2095,7 @@ class CAP4DGaussianModel(GaussianModel):
 
         if self.motion_condition_mode == "cross_attention_v3":
             condition_residual = self.cross_attention_v3_deform_output
-        elif self.motion_condition_mode == "cross_attention_v4":
+        elif self.motion_condition_mode in CAUSAL_CROSS_ATTENTION_MODES:
             condition_residual = self.cross_attention_v4_deform_output
         elif hasattr(self.deform_net, "get_condition_residual"):
             condition_residual = self.deform_net.get_condition_residual()
@@ -1891,6 +2162,31 @@ class CAP4DGaussianModel(GaussianModel):
             return torch.tensor(0., device=self.deform_output.device)
         base_energy = self.deform_base_output.detach().square().mean().clamp_min(1e-10)
         return mismatch_residual.square().mean() / base_energy
+
+    def compute_motion_zero_teacher_loss(self):
+        current = self.motion_zero_current_deform_output
+        teacher = self.motion_zero_teacher_deform_output
+        if current is None or teacher is None:
+            return torch.tensor(0., device=self.deform_output.device)
+        teacher_energy = teacher.detach().square().mean().clamp_min(1e-10)
+        return (current - teacher.detach()).square().mean() / teacher_energy
+
+    def get_cross_attention_trainable_parameters(self):
+        deform_net = self.deform_net.module if hasattr(self.deform_net, "module") else self.deform_net
+        return [
+            param
+            for module in deform_net.modules()
+            if module.__class__.__name__ == "CrossAttentionCondition2d"
+            for param in module.parameters()
+            if param.requires_grad
+        ]
+
+    def compute_motion_attention_regularization(self, entropy_target_ratio):
+        deform_net = self.deform_net.module if hasattr(self.deform_net, "module") else self.deform_net
+        if not hasattr(deform_net, "get_cross_attention_regularization"):
+            zero = torch.tensor(0., device=self.deform_output.device)
+            return zero, zero
+        return deform_net.get_cross_attention_regularization(entropy_target_ratio)
     
     def compute_laplacian_loss(self):
         kernel = torch.tensor(
@@ -1944,16 +2240,15 @@ class CAP4DGaussianModel(GaussianModel):
 
         cross_attention_params = []
         cross_attention_param_ids = set()
+        decoder_params = []
+        decoder_param_ids = set()
+        decoder_table = []
+        decoder_group_name = None
+        deform_net = self.deform_net.module if hasattr(self.deform_net, "module") else self.deform_net
         if (
-            self.motion_condition_mode in (
-                "cross_attention",
-                "cross_attention_v2",
-                "cross_attention_v3",
-                "cross_attention_v4",
-            )
+            self.motion_condition_mode in CROSS_ATTENTION_MODES
             and self.motion_cross_attention_lr_mult > 0
         ):
-            deform_net = self.deform_net.module if hasattr(self.deform_net, "module") else self.deform_net
             for module in deform_net.modules():
                 if module.__class__.__name__ != "CrossAttentionCondition2d":
                     continue
@@ -1963,10 +2258,35 @@ class CAP4DGaussianModel(GaussianModel):
                     cross_attention_params.append(param)
                     cross_attention_param_ids.add(id(param))
 
+        if self.motion_cross_attention_selective_unfreeze:
+            if not hasattr(deform_net, "get_cross_attention_decoder_tail_table"):
+                raise RuntimeError("Conditional U-Net does not expose its decoder tail.")
+            decoder_table = deform_net.get_cross_attention_decoder_tail_table()
+            decoder_group_name = "deform_net_decoder_tail"
+            self.motion_cross_attention_decoder_scope = "tail"
+        elif self.motion_cross_attention_detail_unfreeze:
+            if not hasattr(deform_net, "get_cross_attention_full_decoder_table"):
+                raise RuntimeError("Conditional U-Net does not expose its full decoder.")
+            decoder_table = deform_net.get_cross_attention_full_decoder_table()
+            decoder_group_name = "deform_net_decoder_full"
+            self.motion_cross_attention_decoder_scope = "full"
+
+        if decoder_table:
+            for row in decoder_table:
+                for param in row["module"].parameters():
+                    if id(param) in cross_attention_param_ids or id(param) in decoder_param_ids:
+                        continue
+                    decoder_params.append(param)
+                    decoder_param_ids.add(id(param))
+            self.motion_cross_attention_decoder_tail_params = sum(
+                param.numel() for param in decoder_params
+            )
+
         deform_params = [
             param
             for param in self.deform_net.parameters()
             if id(param) not in cross_attention_param_ids
+            and id(param) not in decoder_param_ids
         ]
         if self.motion_condition_proj is not None:
             deform_params += list(self.motion_condition_proj.parameters())
@@ -1997,12 +2317,108 @@ class CAP4DGaussianModel(GaussianModel):
                 f"weight_decay={self.motion_cross_attention_w_decay}",
             )
 
-        if self.motion_cross_attention_adapter_only:
+        if decoder_params:
+            self.optimizer.add_param_group(
+                {
+                    'params': decoder_params,
+                    'lr': (
+                        training_args.deform_net_lr_init
+                        * self.motion_cross_attention_decoder_lr_mult
+                    ),
+                    'weight_decay': training_args.deform_net_w_decay,
+                    'name': decoder_group_name,
+                }
+            )
+            print(
+                "Cross-attention decoder optimizer group:",
+                f"scope={self.motion_cross_attention_decoder_scope}",
+                f"params={self.motion_cross_attention_decoder_tail_params}",
+                f"lr_mult={self.motion_cross_attention_decoder_lr_mult}",
+                "modules=" + ",".join(row["name"] for row in decoder_table),
+            )
+
+        detail_gaussian_lr_mults = {
+            "xyz": self.motion_cross_attention_gaussian_xyz_lr_mult,
+            "f_dc": self.motion_cross_attention_gaussian_feature_lr_mult,
+            "f_rest": self.motion_cross_attention_gaussian_feature_lr_mult,
+            "opacity": self.motion_cross_attention_gaussian_opacity_lr_mult,
+            "scaling": self.motion_cross_attention_gaussian_scaling_lr_mult,
+            "rotation": self.motion_cross_attention_gaussian_rotation_lr_mult,
+        }
+        self._motion_detail_gaussian_base_lrs = {
+            group["name"]: float(group["lr"])
+            for group in self.optimizer.param_groups
+            if group["name"] in detail_gaussian_lr_mults
+        }
+        self.motion_cross_attention_gaussian_trainable_params = (
+            sum(
+                param.numel()
+                for group in self.optimizer.param_groups
+                if detail_gaussian_lr_mults.get(group["name"], 0.0) > 0.0
+                for param in group["params"]
+            )
+            if self.motion_cross_attention_detail_unfreeze
+            else 0
+        )
+
+        frozen_avatar_profile = (
+            self.motion_cross_attention_adapter_only
+            or self.motion_cross_attention_selective_unfreeze
+            or self.motion_cross_attention_detail_unfreeze
+        )
+        if frozen_avatar_profile:
+            train_groups = {"deform_net_cross_attention"}
+            if self.motion_cross_attention_selective_unfreeze:
+                train_groups.add("deform_net_decoder_tail")
+            elif self.motion_cross_attention_detail_unfreeze:
+                train_groups.add("deform_net_decoder_full")
+                train_groups.update(
+                    name
+                    for name, multiplier in detail_gaussian_lr_mults.items()
+                    if multiplier > 0.0
+                )
             for param_group in self.optimizer.param_groups:
-                train_group = param_group["name"] == "deform_net_cross_attention"
+                train_group = param_group["name"] in train_groups
                 for param in param_group["params"]:
                     param.requires_grad_(train_group)
-            print("Cross-attention adapter-only optimization: all non-attention parameters frozen.")
+            if self.motion_cross_attention_adapter_only:
+                print("Cross-attention adapter-only optimization: all non-attention parameters frozen.")
+            elif self.motion_cross_attention_selective_unfreeze:
+                print(
+                    "Cross-attention selective optimization: attention and decoder tail trainable; "
+                    "Gaussian appearance/geometry, encoder, deep decoder, and neck frozen."
+                )
+            if self.motion_cross_attention_detail_unfreeze:
+                print(
+                    "Cross-attention detail optimization: attention, full decoder, and staged "
+                    "Gaussian appearance/geometry trainable; encoder, neck, and topology frozen.",
+                    f"gaussian_params={self.motion_cross_attention_gaussian_trainable_params}",
+                    f"gaussian_lr_mults={detail_gaussian_lr_mults}",
+                )
+            if (
+                self.motion_cross_attention_selective_unfreeze
+                or self.motion_cross_attention_detail_unfreeze
+            ):
+                runtime_cache = []
+                for module in self.deform_net.modules():
+                    for attribute in (
+                        "last_base_output",
+                        "last_condition_residual",
+                        "last_active_entropy_ratio",
+                        "last_token_balance_loss",
+                    ):
+                        if not hasattr(module, attribute):
+                            continue
+                        runtime_cache.append((module, attribute, getattr(module, attribute)))
+                        setattr(module, attribute, None)
+                try:
+                    self.motion_zero_teacher = copy.deepcopy(self.deform_net).eval()
+                finally:
+                    for module, attribute, value in runtime_cache:
+                        setattr(module, attribute, value)
+                for param in self.motion_zero_teacher.parameters():
+                    param.requires_grad_(False)
+                self.motion_zero_teacher_source = "training_setup_snapshot"
 
         self.deform_net_scheduler_args = get_expon_lr_func(
             lr_init=training_args.deform_net_lr_init,
@@ -2027,7 +2443,11 @@ class CAP4DGaussianModel(GaussianModel):
                 lr_delay_mult=training_args.neck_lr_delay_mult,
                 max_steps=training_args.neck_lr_max_steps,
             )
-            if self.motion_cross_attention_adapter_only:
+            if (
+                self.motion_cross_attention_adapter_only
+                or self.motion_cross_attention_selective_unfreeze
+                or self.motion_cross_attention_detail_unfreeze
+            ):
                 for param in self.neck_rot_offset.parameters():
                     param.requires_grad_(False)
 
@@ -2041,11 +2461,7 @@ class CAP4DGaussianModel(GaussianModel):
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
-        if self.motion_condition_mode in (
-            "cross_attention_v2",
-            "cross_attention_v3",
-            "cross_attention_v4",
-        ):
+        if self.motion_condition_mode in FEATURE_CROSS_ATTENTION_MODES:
             pretrain_iters = self.motion_cross_attention_base_pretrain_iters
             self._cross_attention_base_pretrain_active = iteration <= pretrain_iters
             if self._cross_attention_base_pretrain_active:
@@ -2059,10 +2475,39 @@ class CAP4DGaussianModel(GaussianModel):
                     self._cross_attention_condition_lr_scale = min(1.0, elapsed / warmup_iters)
                 else:
                     self._cross_attention_condition_lr_scale = 1.0
+            decoder_start = self.motion_cross_attention_decoder_start_iter
+            if iteration <= decoder_start:
+                self._cross_attention_decoder_lr_scale = 0.0
+            else:
+                decoder_warmup = self.motion_cross_attention_decoder_warmup_iters
+                if decoder_warmup > 0:
+                    self._cross_attention_decoder_lr_scale = min(
+                        1.0,
+                        (iteration - decoder_start) / decoder_warmup,
+                    )
+                else:
+                    self._cross_attention_decoder_lr_scale = 1.0
         else:
             self._cross_attention_base_pretrain_active = False
             self._cross_attention_base_lr_scale = 1.0
             self._cross_attention_condition_lr_scale = 1.0
+            self._cross_attention_decoder_lr_scale = 1.0
+
+        if self.motion_cross_attention_detail_unfreeze:
+            gaussian_start = self.motion_cross_attention_gaussian_start_iter
+            if iteration <= gaussian_start:
+                self._cross_attention_gaussian_lr_scale = 0.0
+            else:
+                gaussian_warmup = self.motion_cross_attention_gaussian_warmup_iters
+                if gaussian_warmup > 0:
+                    self._cross_attention_gaussian_lr_scale = min(
+                        1.0,
+                        (iteration - gaussian_start) / gaussian_warmup,
+                    )
+                else:
+                    self._cross_attention_gaussian_lr_scale = 1.0
+        else:
+            self._cross_attention_gaussian_lr_scale = 0.0
 
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "deform_net":
@@ -2075,6 +2520,17 @@ class CAP4DGaussianModel(GaussianModel):
                     * self._cross_attention_condition_lr_scale
                 )
                 param_group['lr'] = lr
+            elif param_group["name"] in (
+                "deform_net_decoder_tail",
+                "deform_net_decoder_full",
+            ):
+                lr = (
+                    self.deform_net_scheduler_args(iteration)
+                    * self.motion_cross_attention_decoder_lr_mult
+                    * self._cross_attention_condition_lr_scale
+                    * self._cross_attention_decoder_lr_scale
+                )
+                param_group['lr'] = lr
             
         if not self.static_neck:
             for param_group in self.neck_optimizer.param_groups:
@@ -2084,10 +2540,48 @@ class CAP4DGaussianModel(GaussianModel):
 
         super().update_learning_rate(iteration)
 
-        if self.motion_cross_attention_adapter_only:
+        if self.motion_cross_attention_adapter_only or self.motion_cross_attention_selective_unfreeze:
+            train_groups = {"deform_net_cross_attention"}
+            if self.motion_cross_attention_selective_unfreeze:
+                train_groups.add("deform_net_decoder_tail")
             for param_group in self.optimizer.param_groups:
-                if param_group["name"] != "deform_net_cross_attention":
+                if param_group["name"] not in train_groups:
                     param_group["lr"] = 0.0
+            if not self.static_neck:
+                for param_group in self.neck_optimizer.param_groups:
+                    param_group["lr"] = 0.0
+        elif self.motion_cross_attention_detail_unfreeze:
+            gaussian_lr_mults = {
+                "xyz": self.motion_cross_attention_gaussian_xyz_lr_mult,
+                "f_dc": self.motion_cross_attention_gaussian_feature_lr_mult,
+                "f_rest": self.motion_cross_attention_gaussian_feature_lr_mult,
+                "opacity": self.motion_cross_attention_gaussian_opacity_lr_mult,
+                "scaling": self.motion_cross_attention_gaussian_scaling_lr_mult,
+                "rotation": self.motion_cross_attention_gaussian_rotation_lr_mult,
+            }
+            for param_group in self.optimizer.param_groups:
+                name = param_group["name"]
+                if name == "deform_net_cross_attention":
+                    train_group = bool(param_group["lr"] > 0.0)
+                elif name == "deform_net_decoder_full":
+                    train_group = bool(param_group["lr"] > 0.0)
+                elif name in gaussian_lr_mults:
+                    multiplier = gaussian_lr_mults[name]
+                    if name == "xyz":
+                        base_lr = self.xyz_scheduler_args(iteration)
+                    else:
+                        base_lr = self._motion_detail_gaussian_base_lrs[name]
+                    param_group["lr"] = (
+                        base_lr
+                        * multiplier
+                        * self._cross_attention_gaussian_lr_scale
+                    )
+                    train_group = bool(param_group["lr"] > 0.0)
+                else:
+                    param_group["lr"] = 0.0
+                    train_group = False
+                for param in param_group["params"]:
+                    param.requires_grad_(train_group)
             if not self.static_neck:
                 for param_group in self.neck_optimizer.param_groups:
                     param_group["lr"] = 0.0
@@ -2105,6 +2599,11 @@ class CAP4DGaussianModel(GaussianModel):
             "motion_feature_center_source": self.motion_feature_center_source,
             "motion_feature_common_energy_ratio": self.motion_feature_common_energy_ratio,
             "motion_feature_centered_rms": self.motion_feature_centered_rms,
+            "motion_zero_teacher_deform_net": (
+                self.motion_zero_teacher.state_dict()
+                if self.motion_zero_teacher is not None else None
+            ),
+            "motion_zero_teacher_source": self.motion_zero_teacher_source,
             "motion_condition_proj": (
                 self.motion_condition_proj.state_dict()
                 if self.motion_condition_proj is not None else None
@@ -2178,11 +2677,7 @@ class CAP4DGaussianModel(GaussianModel):
                 raise
             current_state = self.deform_net.state_dict()
             skip_checkpoint_attention = (
-                self.motion_condition_mode in (
-                    "cross_attention_v2",
-                    "cross_attention_v3",
-                    "cross_attention_v4",
-                )
+                self.motion_condition_mode in FEATURE_CROSS_ATTENTION_MODES
                 and chkpt_motion_mode != self.motion_condition_mode
             )
             compatible_state = {}
@@ -2191,17 +2686,18 @@ class CAP4DGaussianModel(GaussianModel):
                 target_key = source_key
                 if (
                     target_key not in current_state
-                    and self.motion_condition_mode in (
-                        "cross_attention_v3",
-                        "cross_attention_v4",
-                    )
+                    and self.motion_condition_mode
+                    in ("cross_attention_v3",) + CAUSAL_CROSS_ATTENTION_MODES
                 ):
                     target_key = self._legacy_unet_key_to_conditional(source_key)
                 if target_key is None or target_key not in current_state:
                     continue
                 if current_state[target_key].shape != value.shape:
                     continue
-                if skip_checkpoint_attention and ".cross_attention_condition." in source_key:
+                if skip_checkpoint_attention and (
+                    ".cross_attention_condition." in source_key
+                    or ".pre_output_cross_attention_condition." in source_key
+                ):
                     continue
                 compatible_state[target_key] = value
                 if target_key != source_key:
@@ -2209,7 +2705,11 @@ class CAP4DGaussianModel(GaussianModel):
             skipped_attention_keys = [
                 key
                 for key in chkpt["deform_net"]
-                if skip_checkpoint_attention and ".cross_attention_condition." in key
+                if skip_checkpoint_attention
+                and (
+                    ".cross_attention_condition." in key
+                    or ".pre_output_cross_attention_condition." in key
+                )
             ]
             skipped_shape_keys = [
                 key
@@ -2217,17 +2717,19 @@ class CAP4DGaussianModel(GaussianModel):
                 if key in current_state and current_state[key].shape != value.shape
             ]
             if (
-                self.motion_cross_attention_adapter_only
-                and self.motion_condition_mode in (
-                    "cross_attention_v3",
-                    "cross_attention_v4",
+                (
+                    self.motion_cross_attention_adapter_only
+                    or self.motion_cross_attention_selective_unfreeze
+                    or self.motion_cross_attention_detail_unfreeze
                 )
+                and self.motion_condition_mode
+                in ("cross_attention_v3",) + CAUSAL_CROSS_ATTENTION_MODES
             ):
                 required_base_keys = {"model.down.0.weight", "model.up.1.weight"}
                 missing_base_keys = required_base_keys.difference(compatible_state)
                 if missing_base_keys:
                     raise RuntimeError(
-                        "Adapter-only initialization refused to freeze an unloaded deformation U-Net. "
+                        "Frozen-avatar initialization refused to use an unloaded deformation U-Net. "
                         f"Missing migrated baseline keys: {sorted(missing_base_keys)}"
                     ) from error
             incompatible = self.deform_net.load_state_dict(compatible_state, strict=False)
@@ -2256,7 +2758,7 @@ class CAP4DGaussianModel(GaussianModel):
         elif self.motion_condition_proj is not None:
             print("WARNING: legacy motion_condition_proj is enabled but not present in checkpoint.")
         if (
-            self.motion_condition_mode == "cross_attention_v4"
+            self.motion_condition_mode in CAUSAL_CROSS_ATTENTION_MODES
             and chkpt.get("motion_feature_center") is not None
         ):
             center = torch.as_tensor(chkpt["motion_feature_center"]).detach().float()
@@ -2289,3 +2791,16 @@ class CAP4DGaussianModel(GaussianModel):
                 f"centered_rms={self.motion_feature_centered_rms:.6f}",
             )
         super().restore(chkpt["gaussians"], training_args)
+        teacher_state = chkpt.get("motion_zero_teacher_deform_net")
+        if teacher_state is not None and self.motion_zero_teacher is not None:
+            self.motion_zero_teacher.load_state_dict(teacher_state)
+            self.motion_zero_teacher.eval()
+            for param in self.motion_zero_teacher.parameters():
+                param.requires_grad_(False)
+            self.motion_zero_teacher_source = str(
+                chkpt.get("motion_zero_teacher_source", "checkpoint")
+            )
+            print(
+                "Restored frozen zero-condition teacher:",
+                f"source={self.motion_zero_teacher_source}",
+            )
